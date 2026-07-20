@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  雲端圖資同步工具 MSI（WiX v4+ 語法，per-user 安裝）
+  - Scope=perUser：裝到使用者的 LocalAppData\Programs，安裝與自動更新皆免系統管理員(UAC)
+  - UpgradeCode 固定不可改：MSI 靠它偵測舊版並自動移除覆蓋（MajorUpgrade）
+  - 版本由建置指令以 -d ProductVersion=x.y.z 傳入（單一來源：drive_sync_gui.py 的 APP_VERSION）
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="雲端圖資同步工具"
+           Manufacturer="裕唯"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="0001F7C6-F236-4106-B4BA-C1B6563ED09B"
+           Scope="perUser"
+           Language="1028"
+           Codepage="950"
+           Compressed="yes">
+
+    <SummaryInformation Description="雲端圖資同步工具 - Google Drive 圖資自動同步" />
+    <!-- afterInstallExecute：新檔先就地覆蓋、舊產品後移除，安裝失敗時可回滾回舊版
+         （預設 afterInstallValidate 會先整個移除舊版，失敗時使用者兩頭空）。
+         AllowSameVersionUpgrades：同版本重建重裝也視為升級，避免裝出兩筆並存。 -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="電腦上已安裝較新版本，無法安裝舊版。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="雲端圖資同步工具" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="AppComponents" Directory="INSTALLFOLDER">
+      <!-- 使用者設定/token/狀態存於 %APPDATA%\雲端圖資同步工具（程式自行管理），
+           不由 MSI 佈署，升級/解除安裝都不會動到 -->
+      <Component Id="MainExe" Guid="762BC689-B861-4C26-8D51-D62E25B0E642">
+        <File Id="AppExe" Source="$(var.ExePath)" Name="雲端圖資同步工具_新版.exe" />
+        <RegistryValue Root="HKCU" Key="Software\裕唯\雲端圖資同步工具"
+                       Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      </Component>
+      <Component Id="AppShortcuts" Guid="614A2C34-C772-4995-AB51-F895D7607DB2">
+        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                  Name="雲端圖資同步工具"
+                  Target="[INSTALLFOLDER]雲端圖資同步工具_新版.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="DesktopShortcut" Directory="DesktopFolder"
+                  Name="雲端圖資同步工具"
+                  Target="[INSTALLFOLDER]雲端圖資同步工具_新版.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\裕唯\雲端圖資同步工具"
+                       Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,30 @@
+# ═══ 機密 / 個人資料 — 絕對不可上傳公開 repo ═══
+credentials.json
+token.json
+config.json
+sync_state.json
+sync_history.json
+xref_flat_manifest.json
+
+# ═══ 建置產物 / 虛擬環境 ═══
+build/
+dist/
+__pycache__/
+.venv/
+venv/
+*.exe
+*.msi
+*.pyc
+
+# ═══ 本機工作雜項 / 公司圖資資料（與同步工具無關）═══
+.claude/
+*.csv
+*.html
+*.rar
+*.lsp
+*.scr
+*.bak
+mcptest_panels.json
+extract_mcptest_panels.ps1
+insert_count_report.txt
+update_log.txt
