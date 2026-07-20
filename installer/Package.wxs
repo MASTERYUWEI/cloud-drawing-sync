@@ -30,7 +30,9 @@
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsDir" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="雲端圖資同步工具" />
+        <Directory Id="INSTALLFOLDER" Name="雲端圖資同步工具">
+          <Directory Id="InternalDir" Name="_internal" />
+        </Directory>
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
@@ -39,11 +41,15 @@
     <ComponentGroup Id="AppComponents" Directory="INSTALLFOLDER">
       <!-- 使用者設定/token/狀態存於 %APPDATA%\雲端圖資同步工具（程式自行管理），
            不由 MSI 佈署，升級/解除安裝都不會動到 -->
+      <!-- MainExe 的 GUID 不可變更：同路徑同 GUID，跨版本升級（含 onefile→onedir
+           轉換）時 Windows Installer 才會正確保留/覆蓋 exe -->
       <Component Id="MainExe" Guid="762BC689-B861-4C26-8D51-D62E25B0E642">
-        <File Id="AppExe" Source="$(var.ExePath)" Name="雲端圖資同步工具_新版.exe" />
+        <File Id="AppExe" Source="$(var.AppDir)\雲端圖資同步工具_新版.exe"
+              Name="雲端圖資同步工具_新版.exe" />
         <RegistryValue Root="HKCU" Key="Software\裕唯\雲端圖資同步工具"
                        Name="Installed" Type="integer" Value="1" KeyPath="yes" />
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveInternalDir" Directory="InternalDir" On="uninstall" />
       </Component>
       <Component Id="AppShortcuts" Guid="614A2C34-C772-4995-AB51-F895D7607DB2">
         <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
@@ -59,8 +65,14 @@
       </Component>
     </ComponentGroup>
 
+    <!-- onedir 的相依檔案（python DLL、套件等）整包收割進 _internal -->
+    <ComponentGroup Id="InternalComponents" Directory="InternalDir">
+      <Files Include="$(var.AppDir)\_internal\**" />
+    </ComponentGroup>
+
     <Feature Id="Main" Level="1">
       <ComponentGroupRef Id="AppComponents" />
+      <ComponentGroupRef Id="InternalComponents" />
     </Feature>
   </Package>
 </Wix>

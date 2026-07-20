@@ -149,6 +149,14 @@ python drive_sync_gui.py
 
 ## 常見問題
 
+### Q: 開啟程式跳出「Failed to load Python DLL ...\Temp\_MEIxxxx\python314.dll」？
+這是 v1.0.1 以前「單檔版」的問題：程式啟動需解壓到 Temp，容易被防毒軟體攔截。
+**請下載 v1.0.2 以後的 MSI 重新安裝**（改為資料夾安裝，不再使用 Temp）。
+若 v1.0.2+ 仍無法啟動：
+1. 安裝 [Microsoft Visual C++ 2015-2022 可轉散發套件 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) 後重試
+2. 確認 Windows 版本為 Windows 10 1809 以上或 Windows 11（按 Win+R 輸入 `winver` 查看）
+3. 檢查防毒軟體的隔離區，將本程式加入排除清單
+
 ### Q: 如何監控其他資料夾？
 在程式的「資料夾 ID」欄位貼上新的 Google Drive 資料夾連結或 ID 後按「立即同步」。
 （資料夾 ID 可從 URL 取得：`https://drive.google.com/drive/folders/【這裡就是ID】`）

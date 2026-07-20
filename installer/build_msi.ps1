@@ -18,8 +18,9 @@ Write-Host "=== 版本 v$ver ===" -ForegroundColor Cyan
 Write-Host "=== PyInstaller 建置 exe ===" -ForegroundColor Cyan
 python -m PyInstaller --noconfirm --clean "雲端圖資同步工具_新版.spec"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失敗" }
-$exe = Join-Path $root 'dist\雲端圖資同步工具_新版.exe'
-if (-not (Test-Path -LiteralPath $exe)) { throw "找不到 $exe" }
+$appdir = Join-Path $root 'dist\雲端圖資同步工具_新版'
+if (-not (Test-Path -LiteralPath (Join-Path $appdir '雲端圖資同步工具_新版.exe'))) { throw "找不到 onedir 輸出 $appdir" }
+if (-not (Test-Path -LiteralPath (Join-Path $appdir '_internal'))) { throw "找不到 $appdir\_internal" }
 
 # 3) WiX 建置 MSI（asset 檔名用 ASCII，GitHub Release 網址較乾淨）
 Write-Host "=== WiX 建置 MSI ===" -ForegroundColor Cyan
@@ -27,7 +28,7 @@ $msi = Join-Path $root "dist\CloudDrawingSync-$ver.msi"
 wix build (Join-Path $PSScriptRoot 'Package.wxs') `
     -arch x64 `
     -d "ProductVersion=$ver" `
-    -d "ExePath=$exe" `
+    -d "AppDir=$appdir" `
     -d "IconPath=$(Join-Path $PSScriptRoot 'app.ico')" `
     -o $msi
 if ($LASTEXITCODE -ne 0) { throw "WiX 失敗" }

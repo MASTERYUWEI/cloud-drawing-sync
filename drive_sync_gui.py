@@ -25,7 +25,7 @@ import customtkinter as ctk
 
 # ==================== 版本 / 自動更新來源 ====================
 
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.0.2'
 GITHUB_OWNER = 'MASTERYUWEI'
 GITHUB_REPO = 'cloud-drawing-sync'
 UPDATE_API_URL = f'https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest'
