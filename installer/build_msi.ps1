@@ -28,6 +28,7 @@ wix build (Join-Path $PSScriptRoot 'Package.wxs') `
     -arch x64 `
     -d "ProductVersion=$ver" `
     -d "ExePath=$exe" `
+    -d "IconPath=$(Join-Path $PSScriptRoot 'app.ico')" `
     -o $msi
 if ($LASTEXITCODE -ne 0) { throw "WiX 失敗" }
 

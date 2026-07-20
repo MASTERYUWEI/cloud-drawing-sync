@@ -24,6 +24,10 @@
                   DowngradeErrorMessage="電腦上已安裝較新版本，無法安裝舊版。" />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- 控制台「應用程式」清單顯示的圖示 -->
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsDir" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="雲端圖資同步工具" />

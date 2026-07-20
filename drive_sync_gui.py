@@ -25,7 +25,7 @@ import customtkinter as ctk
 
 # ==================== 版本 / 自動更新來源 ====================
 
-APP_VERSION = '1.0.0'
+APP_VERSION = '1.0.1'
 GITHUB_OWNER = 'MASTERYUWEI'
 GITHUB_REPO = 'cloud-drawing-sync'
 UPDATE_API_URL = f'https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest'
@@ -639,6 +639,16 @@ class DriveSyncApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(f"雲端圖資同步工具 v{APP_VERSION}")
+        # 視窗/工作列圖示（default= 讓後續 Toplevel 一併套用）；
+        # 打包版在 BUNDLE_DIR 根、開發模式在 installer/ 下
+        for ico in (os.path.join(BUNDLE_DIR, 'app.ico'),
+                    os.path.join(APP_DIR, 'installer', 'app.ico')):
+            if os.path.exists(ico):
+                try:
+                    self.iconbitmap(default=ico)
+                except Exception:
+                    pass
+                break
         self.geometry("1120x820")
         self.minsize(920, 650)
         self.configure(fg_color=Colors.BG)
