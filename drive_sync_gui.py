@@ -25,7 +25,7 @@ import customtkinter as ctk
 
 # ==================== 版本 / 自動更新來源 ====================
 
-APP_VERSION = '1.0.2'
+APP_VERSION = '1.1.0'
 GITHUB_OWNER = 'MASTERYUWEI'
 GITHUB_REPO = 'cloud-drawing-sync'
 UPDATE_API_URL = f'https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest'
@@ -133,8 +133,9 @@ class Colors:
 # ==================== 設定管理 ====================
 
 DEFAULT_CONFIG = {
-    'folder_id': '',
-    'download_path': '',
+    # 同步資料夾清單：每筆 {'name','folder_id','download_path','enabled'}，
+    # 使用者可自行新增/停用多組（雲端資料夾 → 本機資料夾）
+    'sync_pairs': [],
     # 整合圖(套圖)的 XREF 多存成 ".\檔名.dwg"（找同一層），但子圖被分類在
     # 01建築圖、05機電設備… 等子資料夾裡，導致打開整合圖時外部參考全部遺失。
     # 開啟本選項後，每次同步會把子資料夾裡的子圖「複製一份」到整合圖那層，
@@ -145,6 +146,37 @@ DEFAULT_CONFIG = {
     # 啟動時自動到 GitHub Releases 檢查新版本
     'auto_update_check': True,
 }
+
+
+def _normalize_pairs(cfg):
+    """設定升級/清洗：把舊版單一 folder_id/download_path 轉成 sync_pairs 第一筆。"""
+    pairs = cfg.get('sync_pairs')
+    if not isinstance(pairs, list):
+        pairs = []
+    legacy_fid = str(cfg.pop('folder_id', '') or '').strip()
+    legacy_dl = str(cfg.pop('download_path', '') or '').strip()
+    if legacy_fid and legacy_dl and not any(
+            isinstance(p, dict) and p.get('folder_id') == legacy_fid for p in pairs):
+        pairs.insert(0, {'name': '主要圖資', 'folder_id': legacy_fid,
+                         'download_path': legacy_dl, 'enabled': True})
+    clean = []
+    for p in pairs:
+        if not isinstance(p, dict):
+            continue
+        clean.append({
+            'name': str(p.get('name') or '未命名').strip() or '未命名',
+            'folder_id': str(p.get('folder_id') or '').strip(),
+            'download_path': str(p.get('download_path') or '').strip(),
+            'enabled': bool(p.get('enabled', True)),
+        })
+    cfg['sync_pairs'] = clean
+    return cfg
+
+
+def enabled_pairs(cfg):
+    """回傳啟用且欄位齊全的同步資料夾清單。"""
+    return [p for p in cfg.get('sync_pairs', [])
+            if p.get('enabled') and p.get('folder_id') and p.get('download_path')]
 
 XREF_FLAT_FILE = os.path.join(DATA_DIR, 'xref_flat_manifest.json')
 # 主圖(整合圖)判斷：檔名以 ☆ 開頭且含「整合圖」
@@ -161,11 +193,11 @@ def load_config():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
             for k, v in DEFAULT_CONFIG.items():
-                cfg.setdefault(k, v)
-            return cfg
+                cfg.setdefault(k, json.loads(json.dumps(v)))
+            return _normalize_pairs(cfg)
         except (json.JSONDecodeError, OSError):
             pass  # 設定檔損壞時以預設值啟動，不讓程式開不起來
-    return DEFAULT_CONFIG.copy()
+    return _normalize_pairs(json.loads(json.dumps(DEFAULT_CONFIG)))
 
 def save_config(cfg):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -178,7 +210,31 @@ def load_state():
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass  # 狀態檔損壞時視同首次同步（重新比對下載，不會遺失雲端資料）
-    return {'files': {}}
+    return {'pairs': {}}
+
+
+def ensure_state_pairs(state, default_folder_id=''):
+    """狀態檔 v2：{'pairs': {folder_id: {'files': {...}}}}。
+
+    每個同步資料夾各自一桶，孤兒偵測/更新比對互不干擾。
+    v1 的頂層 'files'（單資料夾時代）併入 default_folder_id 那桶。
+    """
+    if not isinstance(state.get('pairs'), dict):
+        state['pairs'] = {}
+    legacy = state.pop('files', None)
+    if isinstance(legacy, dict) and legacy:
+        if default_folder_id:
+            bucket = state['pairs'].setdefault(default_folder_id, {'files': {}})
+            for k, v in legacy.items():
+                bucket.setdefault('files', {}).setdefault(k, v)
+        else:
+            state['files'] = legacy  # 還不知道歸屬，原樣保留待下次
+    return state
+
+
+def pair_files(state, folder_id):
+    """取得（必要時建立）某雲端資料夾的檔案狀態 dict。"""
+    return state['pairs'].setdefault(folder_id, {'files': {}}).setdefault('files', {})
 
 def save_state(state):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
@@ -362,29 +418,31 @@ def launch_msi_upgrade(msi_path):
 
 
 def list_files_recursive(service, folder_id, folder_path="", log=print):
+    """遞迴列出雲端資料夾內所有檔案。
+
+    API 失敗（網路瞬斷、429…）時「直接拋出例外」讓該資料夾整批失敗——
+    以前吞掉例外回傳部分清單，會讓孤兒偵測把缺席子樹的已同步檔
+    全部誤判成「雲端已刪」而搬進回收區。
+    """
     all_files = []
     page_token = None
     while True:
-        try:
-            q = f"'{folder_id}' in parents and trashed = false"
-            resp = service.files().list(
-                q=q, spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, modifiedTime, size)',
-                pageToken=page_token
-            ).execute()
-            for item in resp.get('files', []):
-                if item['mimeType'] == 'application/vnd.google-apps.folder':
-                    sub = os.path.join(folder_path, item['name'])
-                    log(f"  掃描子資料夾: {sub}")
-                    all_files.extend(list_files_recursive(service, item['id'], sub, log))
-                else:
-                    item['folderPath'] = folder_path
-                    all_files.append(item)
-            page_token = resp.get('nextPageToken')
-            if not page_token:
-                break
-        except Exception as e:
-            log(f"API 錯誤: {e}")
+        q = f"'{folder_id}' in parents and trashed = false"
+        resp = service.files().list(
+            q=q, spaces='drive',
+            fields='nextPageToken, files(id, name, mimeType, modifiedTime, size)',
+            pageToken=page_token
+        ).execute(num_retries=2)
+        for item in resp.get('files', []):
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                sub = os.path.join(folder_path, item['name'])
+                log(f"  掃描子資料夾: {sub}")
+                all_files.extend(list_files_recursive(service, item['id'], sub, log))
+            else:
+                item['folderPath'] = folder_path
+                all_files.append(item)
+        page_token = resp.get('nextPageToken')
+        if not page_token:
             break
     return all_files
 
@@ -428,23 +486,61 @@ def download_file(service, file_id, file_name, mime_type, folder_path, download_
 
 # ==================== 整合圖 XREF 攤平（複製子圖到整合圖那層） ====================
 
-def _load_xref_manifest():
-    """讀取「本工具產生的複製檔」清單（相對 download_path 的路徑，正斜線）。"""
+def _manifest_key(dl_path):
+    return os.path.normcase(os.path.abspath(dl_path)).replace('\\', '/')
+
+
+def _read_xref_manifest_raw():
     if os.path.exists(XREF_FLAT_FILE):
         try:
             with open(XREF_FLAT_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get('copies'), list):
-                return set(data['copies'])
+            if isinstance(data, dict):
+                return data
         except (json.JSONDecodeError, OSError):
             pass
-    return set()
+    return {}
 
 
-def _save_xref_manifest(copies):
+def migrate_xref_manifest_v1(first_download_path):
+    """v1（單資料夾時代的頂層 copies）→ v2 {'roots': {root: [rel,...]}}。
+
+    v1 清單一定屬於當時唯一的下載資料夾＝設定升級後的第一筆 sync_pair，
+    在程式啟動時明確搬過去，避免被之後同步的其他資料夾誤認領。
+    """
+    if not first_download_path:
+        return
+    data = _read_xref_manifest_raw()
+    if isinstance(data.get('copies'), list) and data['copies']:
+        roots = data.get('roots') if isinstance(data.get('roots'), dict) else {}
+        key = _manifest_key(first_download_path)
+        merged = set(roots.get(key, [])) | set(data['copies'])
+        roots[key] = sorted(merged)
+        try:
+            with open(XREF_FLAT_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'roots': roots}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+
+def _load_xref_manifest(dl_path):
+    """讀取某下載根目錄的「本工具產生的複製檔」清單（相對路徑、正斜線）。"""
+    data = _read_xref_manifest_raw()
+    roots = data.get('roots') if isinstance(data.get('roots'), dict) else {}
+    lst = roots.get(_manifest_key(dl_path), [])
+    return set(lst) if isinstance(lst, list) else set()
+
+
+def _save_xref_manifest(dl_path, copies):
+    data = _read_xref_manifest_raw()
+    roots = data.get('roots') if isinstance(data.get('roots'), dict) else {}
+    roots[_manifest_key(dl_path)] = sorted(copies)
+    payload = {'roots': roots}
+    if isinstance(data.get('copies'), list) and data['copies']:
+        payload['copies'] = data['copies']  # 尚未認領的 v1 清單保留，待 migrate 認領
     try:
         with open(XREF_FLAT_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'copies': sorted(copies)}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
@@ -473,7 +569,7 @@ def flatten_xrefs(dl_path, log=print, enabled=True):
     - enabled=False 時只執行清理（移除先前建立的複製檔）。
     回傳 dict: copied / removed / skipped / conflicts。
     """
-    old = _load_xref_manifest()
+    old = _load_xref_manifest(dl_path)
     managed = set()          # 本次仍應存在的複製檔（相對路徑）
     copied = removed = skipped = 0
     conflicts = []
@@ -532,7 +628,7 @@ def flatten_xrefs(dl_path, log=print, enabled=True):
             except OSError:
                 managed.add(rel)  # 刪不掉就保留在清單，下次再試
 
-    _save_xref_manifest(managed)
+    _save_xref_manifest(dl_path, managed)
     return {'copied': copied, 'removed': removed,
             'skipped': skipped, 'conflicts': conflicts}
 
@@ -661,6 +757,9 @@ class DriveSyncApp(ctk.CTk):
         self.is_syncing = False
         self.service = None
         self.config = load_config()
+        # 套圖清單 v1（單資料夾時代）→ v2（每個下載根目錄各一份）
+        _pairs = self.config.get('sync_pairs', [])
+        migrate_xref_manifest_v1(_pairs[0]['download_path'] if _pairs else '')
         self._all_files = []
         self._today_new = []
         self._today_updated = []
@@ -670,8 +769,6 @@ class DriveSyncApp(ctk.CTk):
         self._current_tab = None
 
         # Variables
-        self.v_fid = ctk.StringVar(value=self.config.get('folder_id', ''))
-        self.v_path = ctk.StringVar(value=self.config.get('download_path', ''))
         self.v_status = ctk.StringVar(value='尚未連線')
         self.v_last = ctk.StringVar(value='--')
         self.v_count = ctk.StringVar(value='0 個')
@@ -765,44 +862,242 @@ class DriveSyncApp(ctk.CTk):
         card = ctk.CTkFrame(parent, corner_radius=14, fg_color=Colors.SURFACE,
                             border_width=1, border_color=Colors.SURFACE_ALT)
         card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        card.grid_columnconfigure(1, weight=1)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(2, weight=1)
 
-        ctk.CTkLabel(card, text="同步設定",
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=25, pady=(20, 6))
+        ctk.CTkLabel(head, text="同步資料夾",
                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=15, weight="bold"),
-                     text_color=Colors.TEXT).grid(row=0, column=0, columnspan=3, sticky="w", padx=25, pady=(20, 6))
+                     text_color=Colors.TEXT).pack(side="left")
+        ctk.CTkLabel(head, text="　可新增多個「雲端 → 本機」資料夾，同步時依序處理",
+                     font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+                     text_color=Colors.TEXT_MUTED).pack(side="left")
         ctk.CTkFrame(card, height=1, fg_color=Colors.SURFACE_ALT).grid(
-            row=1, column=0, columnspan=3, sticky="ew", padx=25, pady=(0, 14))
+            row=1, column=0, sticky="ew", padx=25, pady=(0, 8))
 
-        # 資料夾 ID / 連結
-        self._label(card, "資料夾 ID 或連結", 2)
-        self.entry_fid = ctk.CTkEntry(card, textvariable=self.v_fid, height=36, corner_radius=16,
-                                       font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
-                                       placeholder_text="貼上 Google Drive 資料夾連結或 ID",
-                                       border_color=Colors.SURFACE_ALT, fg_color=Colors.BG)
-        self.entry_fid.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 25), pady=6)
+        # 清單
+        wrap = ctk.CTkFrame(card, fg_color="transparent")
+        wrap.grid(row=2, column=0, sticky="nsew", padx=25, pady=(0, 4))
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        self.pairs_tree = ttk.Treeview(wrap, columns=('name', 'path', 'state'),
+                                       show='headings', height=4)
+        self.pairs_tree.heading('name', text='名稱')
+        self.pairs_tree.heading('path', text='本機資料夾')
+        self.pairs_tree.heading('state', text='狀態')
+        self.pairs_tree.column('name', width=110, anchor='w')
+        self.pairs_tree.column('path', width=330, anchor='w')
+        self.pairs_tree.column('state', width=56, anchor='center')
+        self.pairs_tree.grid(row=0, column=0, sticky='nsew')
+        self.pairs_tree.bind('<Double-1>', lambda e: self._edit_pair())
 
-        # 下載路徑
-        self._label(card, "下載路徑", 3)
-        self.entry_path = ctk.CTkEntry(card, textvariable=self.v_path, height=36, corner_radius=16,
-                                        font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
-                                        border_color=Colors.SURFACE_ALT, fg_color=Colors.BG)
-        self.entry_path.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=6)
-        ctk.CTkButton(card, text="瀏覽", width=64, height=36, corner_radius=17,
+        # 操作列
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=25, pady=(4, 16))
+
+        def _mini_btn(text, cmd, accent=False):
+            return ctk.CTkButton(
+                btns, text=text, height=32, corner_radius=16,
+                width=88 if accent else 74,
+                font=ctk.CTkFont(family=self.FONT_FAMILY, size=12,
+                                 weight="bold" if accent else "normal"),
+                fg_color=Colors.PRIMARY if accent else "transparent",
+                hover_color=Colors.PRIMARY_HOVER if accent else Colors.BG,
+                border_width=0 if accent else 1, border_color=Colors.SURFACE_ALT,
+                text_color=Colors.TEXT_WHITE if accent else Colors.TEXT_SEC,
+                command=cmd)
+
+        _mini_btn("➕ 新增", self._add_pair, accent=True).pack(side="left", padx=(0, 8))
+        _mini_btn("✏️ 編輯", self._edit_pair).pack(side="left", padx=(0, 8))
+        _mini_btn("啟用/停用", self._toggle_pair).pack(side="left", padx=(0, 8))
+        _mini_btn("🗑 移除", self._remove_pair).pack(side="left")
+
+        self._reload_pairs_view()
+
+    # ── 同步資料夾清單管理 ──
+
+    def _reload_pairs_view(self):
+        self.pairs_tree.delete(*self.pairs_tree.get_children())
+        for i, p in enumerate(self.config.get('sync_pairs', [])):
+            state = '✅' if p.get('enabled') else '⏸'
+            self.pairs_tree.insert('', 'end', iid=str(i),
+                                   values=(p.get('name', ''), p.get('download_path', ''), state))
+
+    def _selected_pair_index(self):
+        sel = self.pairs_tree.selection()
+        if not sel:
+            messagebox.showinfo('提示', '請先在清單中點選一個資料夾。')
+            return None
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return None
+        if 0 <= idx < len(self.config.get('sync_pairs', [])):
+            return idx
+        return None
+
+    def _pairs_locked(self):
+        if self.is_syncing:
+            messagebox.showinfo('同步進行中', '請等同步完成後再調整同步資料夾。')
+            return True
+        return False
+
+    def _add_pair(self):
+        if self._pairs_locked():
+            return
+        self._pair_dialog(None)
+
+    def _edit_pair(self):
+        if self._pairs_locked():
+            return
+        idx = self._selected_pair_index()
+        if idx is not None:
+            self._pair_dialog(idx)
+
+    def _toggle_pair(self):
+        if self._pairs_locked():
+            return
+        idx = self._selected_pair_index()
+        if idx is None:
+            return
+        p = self.config['sync_pairs'][idx]
+        p['enabled'] = not p.get('enabled', True)
+        save_config(self.config)
+        self._reload_pairs_view()
+        self._log(f"同步資料夾「{p['name']}」已{'啟用' if p['enabled'] else '停用'}", 'info')
+
+    def _remove_pair(self):
+        if self._pairs_locked():
+            return
+        idx = self._selected_pair_index()
+        if idx is None:
+            return
+        p = self.config['sync_pairs'][idx]
+        if not messagebox.askyesno(
+                '移除確認',
+                f"確定移除同步資料夾「{p['name']}」？\n\n"
+                "只是不再同步；已下載到本機的檔案不會被刪除。"):
+            return
+        self.config['sync_pairs'].pop(idx)
+        save_config(self.config)
+        self._reload_pairs_view()
+        self._refresh_files()
+        self._log(f"已移除同步資料夾「{p['name']}」", 'info')
+
+    def _pair_dialog(self, idx):
+        """新增(idx=None)或編輯同步資料夾的小視窗。"""
+        editing = idx is not None
+        p = self.config['sync_pairs'][idx] if editing else \
+            {'name': '', 'folder_id': '', 'download_path': '', 'enabled': True}
+
+        win = ctk.CTkToplevel(self)
+        win.title('編輯同步資料夾' if editing else '新增同步資料夾')
+        win.geometry('560x300')
+        win.configure(fg_color=Colors.BG)
+        win.transient(self)
+        win.grid_columnconfigure(1, weight=1)
+
+        def _grab():
+            try:
+                win.grab_set()
+            except Exception:
+                pass  # 視窗尚未顯示時 grab 會失敗，略過即可
+        win.after(150, _grab)
+
+        v_name = ctk.StringVar(value=p.get('name', ''))
+        v_fid = ctk.StringVar(value=p.get('folder_id', ''))
+        v_dl = ctk.StringVar(value=p.get('download_path', ''))
+
+        def row(r, label):
+            ctk.CTkLabel(win, text=label, font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+                         text_color=Colors.TEXT_SEC).grid(row=r, column=0, sticky='w',
+                                                          padx=(24, 10), pady=10)
+
+        row(0, '名稱')
+        ctk.CTkEntry(win, textvariable=v_name, height=36, corner_radius=16,
+                     placeholder_text='例：岡山案場、台南案場…',
+                     font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+                     border_color=Colors.SURFACE_ALT, fg_color=Colors.SURFACE
+                     ).grid(row=0, column=1, columnspan=2, sticky='ew', padx=(0, 24), pady=10)
+        row(1, '雲端資料夾連結或 ID')
+        ctk.CTkEntry(win, textvariable=v_fid, height=36, corner_radius=16,
+                     placeholder_text='貼上 Google Drive 資料夾連結',
+                     font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+                     border_color=Colors.SURFACE_ALT, fg_color=Colors.SURFACE
+                     ).grid(row=1, column=1, columnspan=2, sticky='ew', padx=(0, 24), pady=10)
+        row(2, '本機下載資料夾')
+        ctk.CTkEntry(win, textvariable=v_dl, height=36, corner_radius=16,
+                     font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+                     border_color=Colors.SURFACE_ALT, fg_color=Colors.SURFACE
+                     ).grid(row=2, column=1, sticky='ew', padx=(0, 8), pady=10)
+
+        def browse():
+            d = filedialog.askdirectory(title='選擇本機下載資料夾', parent=win,
+                                        initialdir=v_dl.get() or os.path.expanduser('~'))
+            if d:
+                v_dl.set(d)
+
+        ctk.CTkButton(win, text='瀏覽', width=64, height=36, corner_radius=17,
                       font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
-                      fg_color="transparent", border_width=1, border_color=Colors.SURFACE_ALT,
-                      text_color=Colors.TEXT_SEC, hover_color=Colors.BG,
-                      command=self._browse).grid(row=3, column=2, padx=(0, 25), pady=6)
+                      fg_color='transparent', border_width=1, border_color=Colors.SURFACE_ALT,
+                      text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
+                      command=browse).grid(row=2, column=2, padx=(0, 24), pady=10)
 
-        # 儲存
-        ctk.CTkButton(card, text="儲存設定", height=36, corner_radius=17,
-                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=13, weight="bold"),
+        def ok():
+            if self.is_syncing:
+                messagebox.showinfo('同步進行中', '請等同步完成後再儲存。', parent=win); return
+            if editing and not (0 <= idx < len(self.config['sync_pairs'])):
+                messagebox.showerror('錯誤', '清單已變動，請關閉視窗後重新選取。', parent=win); return
+            name = v_name.get().strip() or '未命名'
+            fid = self._parse_folder_id(v_fid.get().strip())
+            dl = v_dl.get().strip()
+            if not fid:
+                messagebox.showerror('錯誤', '請貼上 Google Drive 資料夾連結或 ID', parent=win); return
+            if not re.fullmatch(r'[A-Za-z0-9_-]{10,}', fid):
+                messagebox.showerror('錯誤', '雲端資料夾連結/ID 格式不正確，\n請直接複製 Google Drive 資料夾網址貼上', parent=win); return
+            if not dl:
+                messagebox.showerror('錯誤', '請選擇本機下載資料夾', parent=win); return
+            dl_key = os.path.normcase(os.path.abspath(dl))
+            for i, other in enumerate(self.config['sync_pairs']):
+                if editing and i == idx:
+                    continue
+                if other.get('folder_id') == fid:
+                    messagebox.showerror('錯誤', f'這個雲端資料夾已在清單中（{other["name"]}）', parent=win); return
+                op = os.path.normcase(os.path.abspath(other.get('download_path') or ''))
+                if op and (dl_key == op or dl_key.startswith(op + os.sep) or op.startswith(dl_key + os.sep)):
+                    messagebox.showerror(
+                        '錯誤',
+                        f'本機資料夾與「{other["name"]}」的下載資料夾相同或互相包含，\n'
+                        '兩個雲端資料夾同步到同一處會互相覆蓋，請改選不同資料夾。',
+                        parent=win); return
+            try:
+                os.makedirs(dl, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror('錯誤', f'無法建立/存取下載資料夾：\n{e}', parent=win); return
+            entry = {'name': name, 'folder_id': fid, 'download_path': dl,
+                     'enabled': p.get('enabled', True)}
+            if editing:
+                self.config['sync_pairs'][idx] = entry
+            else:
+                self.config['sync_pairs'].append(entry)
+            save_config(self.config)
+            self._reload_pairs_view()
+            self._refresh_files()
+            self._log(f"已{'更新' if editing else '新增'}同步資料夾「{name}」", 'success')
+            win.destroy()
+
+        foot = ctk.CTkFrame(win, fg_color='transparent')
+        foot.grid(row=3, column=0, columnspan=3, sticky='e', padx=24, pady=(14, 18))
+        ctk.CTkButton(foot, text='取消', width=88, height=36, corner_radius=17,
+                      fg_color='transparent', border_width=1, border_color=Colors.SURFACE_ALT,
+                      text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
+                      command=win.destroy).pack(side='right', padx=(8, 0))
+        ctk.CTkButton(foot, text='確定', width=88, height=36, corner_radius=17,
+                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=13, weight='bold'),
                       fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER,
-                      command=self._save_settings).grid(row=4, column=1, columnspan=2,
-                                                         sticky="e", padx=(0, 25), pady=(6, 20))
-
-    def _label(self, parent, text, row):
-        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
-                     text_color=Colors.TEXT_SEC).grid(row=row, column=0, sticky="w", padx=25, pady=6)
+                      command=ok).pack(side='right')
+        win.after(60, win.lift)
 
     # ── 狀態卡片 ──
 
@@ -1128,26 +1423,6 @@ class DriveSyncApp(ctk.CTk):
                 break
         self.after(100, self._poll)
 
-    def _browse(self):
-        p = filedialog.askdirectory(title='選擇下載資料夾',
-                                    initialdir=self.v_path.get() or os.path.expanduser('~'))
-        if p:
-            self.v_path.set(p)
-
-    def _save_settings(self):
-        fid = self.v_fid.get().strip()
-        dl  = self.v_path.get().strip()
-        if not fid:
-            messagebox.showerror('錯誤', '請輸入 Google Drive 資料夾 ID 或連結'); return
-        fid = self._parse_folder_id(fid)
-        self.v_fid.set(fid)
-        if not dl:
-            messagebox.showerror('錯誤', '請設定下載路徑'); return
-        os.makedirs(dl, exist_ok=True)
-        self.config.update({'folder_id': fid, 'download_path': dl})
-        save_config(self.config)
-        self._log('設定已儲存', 'success')
-
     @staticmethod
     def _parse_folder_id(text):
         match = re.search(r'folders/([a-zA-Z0-9_-]+)', text)
@@ -1314,20 +1589,9 @@ class DriveSyncApp(ctk.CTk):
             self._log('同步進行中，請稍候', 'warning'); return
         if not self.service:
             self._log('尚未連線', 'error'); return
-        # 同步前自動讀取 UI 上的最新設定
-        fid = self.v_fid.get().strip()
-        dl  = self.v_path.get().strip()
-        if fid:
-            fid = self._parse_folder_id(fid)
-            self.v_fid.set(fid)
-        if not fid:
-            messagebox.showerror('錯誤', '請輸入 Google Drive 資料夾 ID 或連結'); return
-        if not dl:
-            messagebox.showerror('錯誤', '請先設定下載路徑'); return
-        # 自動儲存（用 update，避免把 flatten_xrefs 等其他設定鍵洗掉）
-        os.makedirs(dl, exist_ok=True)
-        self.config.update({'folder_id': fid, 'download_path': dl})
-        save_config(self.config)
+        if not enabled_pairs(self.config):
+            messagebox.showerror('錯誤', '請先在「同步資料夾」清單按「➕ 新增」\n加入至少一個要同步的資料夾。')
+            return
         self.is_syncing = True
         self.btn_sync.configure(state='disabled', text="同步中...")
         threading.Thread(target=self._sync_worker, daemon=True).start()
@@ -1465,10 +1729,11 @@ class DriveSyncApp(ctk.CTk):
 
         foot = ctk.CTkFrame(win, fg_color='transparent')
         foot.pack(fill='x', padx=12, pady=(0, 12))
-        ctk.CTkButton(foot, text='開啟下載資料夾',
+        ctk.CTkButton(foot, text='開啟回收位置' if recycled else '開啟所在資料夾',
                       fg_color=Colors.SURFACE_ALT, text_color=Colors.TEXT,
                       hover_color=Colors.APRICOT_HOVER,
-                      command=lambda: self._open_in_explorer(self.config.get('download_path', ''))
+                      command=lambda: self._open_in_explorer(
+                          os.path.dirname(rows[0]['open_path']) if rows else '')
                       ).pack(side='left')
         ctk.CTkButton(foot, text='關閉', width=90,
                       fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER,
@@ -1489,157 +1754,83 @@ class DriveSyncApp(ctk.CTk):
             self._log(f'  原因: {reason}', 'error')
             self._log(f'  建議: {hint}', 'warning')
 
+    @staticmethod
+    def _pair_prefix(pair, multi):
+        """多資料夾時的顯示前綴（名稱中的斜線替換為全形，避免弄壞路徑分組）。"""
+        if not multi:
+            return ''
+        name = (pair.get('name') or pair.get('folder_id', '')[:8])
+        name = name.replace('/', '／').replace('\\', '＼')
+        return f'[{name}] '
+
     def _sync_worker(self):
         try:
             self._log('─' * 40, 'info')
             self._log('開始同步...', 'info')
+            pairs = enabled_pairs(self.config)
+            if not pairs:
+                self._log('沒有啟用中的同步資料夾', 'warning'); return
+            multi = len(pairs) > 1
             state = load_state()
-            dl_path = self.config['download_path']
-            os.makedirs(dl_path, exist_ok=True)
-            # 記錄本次同步前每個 fileId 的下載位置，供事後偵測改名/搬移殘留
-            old_paths = {fid: info.get('localPath')
-                         for fid, info in state['files'].items()}
+            # v1 狀態一律歸入設定清單第一筆（＝設定升級時舊資料夾的位置），
+            # 與 migrate_xref_manifest_v1/_refresh_files 一致；不可用「第一個啟用」的，
+            # 否則停用主要資料夾時 v1 狀態會併錯桶、觸發整批誤回收
+            all_pairs = self.config.get('sync_pairs', [])
+            legacy_fid = all_pairs[0]['folder_id'] if all_pairs else ''
+            ensure_state_pairs(state, legacy_fid)
 
-            self._log('正在掃描雲端資料夾...', 'info')
-            files = list_files_recursive(self.service, self.config['folder_id'], log=self._log)
-            if not files:
-                self._log('資料夾中沒有檔案', 'warning'); return
-
-            self._log(f'找到 {len(files)} 個檔案', 'info')
             new_c = upd_c = unch_c = err_c = 0
-            session_new = []
-            session_upd = []
-            session_err = []
-            session_ok_ids = set()
+            session_new, session_upd, session_err = [], [], []
+            session_ok_keys = set()         # {(folder_id, fileId)}：pending 過濾需分資料夾
+            all_conflict_rows = []          # 攤平同名衝突（跨資料夾彙整）
+            orphan_rows_recycled = []       # 已回收孤兒（跨資料夾彙整）
+            orphan_rows_report = []         # 僅回報孤兒
+            failed_pairs = []
+            any_listed = False
 
-            for f in files:
-                fid, fname, mime = f['id'], f['name'], f['mimeType']
-                mod = f['modifiedTime']
-                fpath = f.get('folderPath', '')
-                display = os.path.join(fpath, fname) if fpath else fname
-                if mime == 'application/vnd.google-apps.folder':
-                    continue
-
-                local_p = os.path.join(dl_path, fpath, fname)
-                if mime in GOOGLE_EXPORT_TYPES and not os.path.splitext(fname)[1]:
-                    local_p += GOOGLE_EXPORT_TYPES[mime][1]
-
-                last_mod = state['files'].get(fid, {}).get('modifiedTime', '')
-
-                action = None
-                if not os.path.exists(local_p):
-                    self._log(f'新增: {display}', 'new')
-                    action = 'new'
-                elif mod != last_mod:
-                    self._log(f'更新: {display}', 'update')
-                    action = 'update'
-                else:
-                    unch_c += 1; continue
-
+            for pair in pairs:
+                pname = pair.get('name') or pair['folder_id'][:8]
+                prefix = self._pair_prefix(pair, multi)
                 try:
-                    result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log)
+                    r = self._sync_one_pair(pair, state, prefix)
                 except Exception as e:
-                    err_c += 1
                     reason, hint = self._sync_error_info(e)
-                    session_err.append({
-                        'file': display,
-                        'path': local_p,
-                        'reason': reason,
-                        'hint': hint,
-                        'fileId': fid,
-                        'fileName': fname,
-                        'mimeType': mime,
-                        'folderPath': fpath,
-                        'modifiedTime': mod,
-                        'action': action,
-                        'time': datetime.now().isoformat(timespec='seconds'),
-                    })
-                    self._log(f'  未同步: {display}', 'error')
-                    self._log(f'    原因: {reason}', 'error')
-                    self._log(f'    建議: {hint}', 'warning')
-                    self._log(f'    路徑: {local_p}', 'warning')
+                    self._log(f'{prefix}同步流程中止: {reason}', 'error')
+                    self._log(f'  建議: {hint}', 'warning')
+                    self._log(f'  原始錯誤: {type(e).__name__}: {e}', 'error')
+                    failed_pairs.append((pname, reason, hint, f'{type(e).__name__}: {e}'))
                     continue
+                any_listed = any_listed or r['listed']
+                new_c += r['new']; upd_c += r['upd']; unch_c += r['unch']; err_c += r['err']
+                session_new.extend(r['session_new'])
+                session_upd.extend(r['session_upd'])
+                session_err.extend(r['session_err'])
+                session_ok_keys |= r['ok_keys']
+                all_conflict_rows.extend(r['conflicts'])
+                orphan_rows_recycled.extend(r['orphans_recycled'])
+                orphan_rows_report.extend(r['orphans_report'])
 
-                if result:
-                    self._log(f'  完成: {fname}', 'success')
-                    if action == 'new':
-                        new_c += 1; session_new.append(display)
-                    elif action == 'update':
-                        upd_c += 1; session_upd.append(display)
-                    state['files'][fid] = {
-                        'name': fname, 'folderPath': fpath,
-                        'modifiedTime': mod, 'localPath': result,
-                    }
-                    session_ok_ids.add(fid)
+            if failed_pairs:
+                pn, reason, hint, detail = failed_pairs[0]
+                head = f'資料夾「{pn}」{reason}' if multi else reason
+                if len(failed_pairs) > 1:
+                    head += f'（另有 {len(failed_pairs) - 1} 個資料夾失敗）'
+                self.after(0, lambda h=head, hi=hint, d=detail: self._show_sync_fatal_error(h, hi, d))
 
-            save_state(state)
-
-            # 整合圖 XREF 攤平：複製子圖到整合圖那層，讓外部參考解析得到
-            try:
-                fx = flatten_xrefs(dl_path, self._log,
-                                   enabled=self.config.get('flatten_xrefs', True))
-                conflicts = fx['conflicts']
-                if fx['copied'] or fx['removed'] or conflicts:
-                    self._log(
-                        f"套圖連結整理完成  複製: {fx['copied']}  移除失效: {fx['removed']}"
-                        + (f"  ⚠同名衝突: {len(conflicts)}" if conflicts else ''),
-                        'warning' if conflicts else 'success')
-                    with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
-                        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        lf.write(f"[{ts}] 套圖連結整理 - 複製: {fx['copied']}, "
-                                 f"移除失效: {fx['removed']}, 同名衝突: {len(conflicts)}\n")
-                        for c in conflicts:
-                            lf.write(f"  同名衝突(未複製): {c['folder']}\\{c['name']} "
-                                     f"← {'、'.join(c['sources'])}\n")
-                for c in conflicts:
-                    self._log(f"  ⚠同名衝突(未複製): {c['name']}｜{'、'.join(c['sources'])}", 'warning')
-                if conflicts:
-                    self.after(0, lambda cf=conflicts: self._show_xref_conflicts(cf))
-            except Exception as e:
-                self._log(f'套圖連結整理略過: {e}', 'warning')
-
-            # 孤兒檔處理：雲端已刪/改名的本機殘留檔，移到「回收區」（可還原、非刪除）
-            try:
-                cloud_ids = {f['id'] for f in files}
-                orphans = find_orphans(state['files'], cloud_ids, old_paths, dl_path)
-                if orphans:
-                    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    if self.config.get('auto_recycle_orphans', True):
-                        date_str = datetime.now().strftime('%Y-%m-%d')
-                        moved, failed = recycle_orphans(orphans, date_str)
-                        self._log(
-                            f'已回收 {len(moved)} 個雲端已移除的殘留檔到「{RECYCLE_DIR}/{date_str}」'
-                            + (f'（{len(failed)} 個回收失敗）' if failed else ''), 'warning')
-                        for mv in moved[:10]:
-                            self._log(f'  回收: {mv["rel"]}', 'warning')
-                        for fa in failed:
-                            self._log(f'  回收失敗: {fa["name"]}｜{fa["error"]}', 'error')
-                        with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
-                            lf.write(f"[{ts}] 孤兒檔回收: 移入回收區 {len(moved)} 個, 失敗 {len(failed)} 個\n")
-                            for mv in moved:
-                                lf.write(f"  回收: {mv['rel']} → {os.path.relpath(mv['dest'], dl_path)}\n")
-                        rows = [{'name': mv['name'], 'rel': mv['rel'], 'open_path': mv['dest']}
-                                for mv in moved]
-                        if rows:
-                            self.after(0, lambda r=rows: self._show_orphans_panel(r, True))
-                    else:
-                        self._log(f'發現 {len(orphans)} 個雲端已移除的殘留檔（未回收）', 'warning')
-                        with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
-                            lf.write(f"[{ts}] 雲端已移除殘留檔: {len(orphans)} 個（未回收）\n")
-                            for o in orphans:
-                                lf.write(f"  殘留: {o['rel']}\n")
-                        rows = [{'name': o['name'], 'rel': o['rel'], 'open_path': o['path']}
-                                for o in orphans]
-                        self.after(0, lambda r=rows: self._show_orphans_panel(r, False))
-            except Exception as e:
-                self._log(f'孤兒檔處理略過: {e}', 'warning')
+            if not any_listed and not session_err:
+                # 所有資料夾都空清單或失敗：不寫歷史、不更新上次同步時間（與舊版一致）
+                return
 
             # 寫入同步歷史：本次紀錄 + 更新未同步清單（成功的移除、失敗的更新）
             history = load_history()
-            err_ids = {item.get('fileId') for item in session_err}
+
+            def pkey(p):
+                # 舊版 pending 沒記 folderId → 視為屬於設定清單第一筆
+                return (p.get('folderId') or legacy_fid, p.get('fileId'))
+            err_keys = {pkey(item) for item in session_err}
             history['pending'] = [
                 p for p in history.get('pending', [])
-                if p.get('fileId') not in session_ok_ids and p.get('fileId') not in err_ids
+                if pkey(p) not in session_ok_keys and pkey(p) not in err_keys
             ]
             history['pending'].extend(session_err)
             history['sessions'].append({
@@ -1649,11 +1840,20 @@ class DriveSyncApp(ctk.CTk):
             })
             save_history(history)
 
+            if all_conflict_rows:
+                self.after(0, lambda cf=all_conflict_rows: self._show_xref_conflicts(cf))
+            if orphan_rows_recycled:
+                self.after(0, lambda r=orphan_rows_recycled: self._show_orphans_panel(r, True))
+            if orphan_rows_report:
+                self.after(0, lambda r=orphan_rows_report: self._show_orphans_panel(r, False))
+
             self._log('─' * 40, 'info')
-            summary = f'同步完成  新增: {new_c}  更新: {upd_c}  未變更: {unch_c}'
+            head = '同步完成' if not multi else \
+                f'同步完成（{len(pairs) - len(failed_pairs)}/{len(pairs)} 個資料夾）'
+            summary = f'{head}  新增: {new_c}  更新: {upd_c}  未變更: {unch_c}'
             if err_c:
                 summary += f'  失敗: {err_c}'
-            self._log(summary, 'warning' if err_c else 'success')
+            self._log(summary, 'warning' if (err_c or failed_pairs) else 'success')
             if session_err:
                 self._log('未同步檔案摘要:', 'warning')
                 for item in session_err[:10]:
@@ -1669,9 +1869,6 @@ class DriveSyncApp(ctk.CTk):
             self._today_last_ts = datetime.now()
             self.after(0, self._render_today)
             self.after(0, self._reload_history_views)
-
-            if new_c > 0 or upd_c > 0 or err_c > 0:
-                self._append_update_log(dl_path, '同步', new_c, upd_c, err_c, session_err)
         except Exception as e:
             reason, hint = self._sync_error_info(e)
             detail = f'{type(e).__name__}: {e}'
@@ -1682,6 +1879,165 @@ class DriveSyncApp(ctk.CTk):
         finally:
             self.is_syncing = False
             self.after(0, lambda: self.btn_sync.configure(state='normal', text="立即同步"))
+
+    def _sync_one_pair(self, pair, state, prefix):
+        """同步單一「雲端資料夾 → 本機資料夾」，回傳統計與待彙整資訊。"""
+        pname = pair.get('name') or pair['folder_id'][:8]
+        folder_id = pair['folder_id']
+        dl_path = pair['download_path']
+        files_state = pair_files(state, folder_id)
+        os.makedirs(dl_path, exist_ok=True)
+        # 記錄本次同步前每個 fileId 的下載位置，供事後偵測改名/搬移殘留
+        old_paths = {fid: info.get('localPath') for fid, info in files_state.items()}
+
+        if prefix:
+            self._log('─' * 40, 'info')
+        self._log(f'{prefix}正在掃描雲端資料夾...', 'info')
+        files = list_files_recursive(self.service, folder_id, log=self._log)
+        result = {'new': 0, 'upd': 0, 'unch': 0, 'err': 0, 'listed': False,
+                  'session_new': [], 'session_upd': [], 'session_err': [],
+                  'ok_keys': set(), 'conflicts': [],
+                  'orphans_recycled': [], 'orphans_report': []}
+        if not files:
+            self._log(f'{prefix}資料夾中沒有檔案', 'warning')
+            return result
+
+        result['listed'] = True
+        self._log(f'{prefix}找到 {len(files)} 個檔案', 'info')
+        for f in files:
+            fid, fname, mime = f['id'], f['name'], f['mimeType']
+            mod = f['modifiedTime']
+            fpath = f.get('folderPath', '')
+            # 根層檔案時把前綴當資料夾段，今日更新的分組才不會把不同資料夾的根層檔混在一起
+            if fpath:
+                display = prefix + os.path.join(fpath, fname)
+            elif prefix:
+                display = os.path.join(prefix.strip(), fname)
+            else:
+                display = fname
+            if mime == 'application/vnd.google-apps.folder':
+                continue
+
+            local_p = os.path.join(dl_path, fpath, fname)
+            if mime in GOOGLE_EXPORT_TYPES and not os.path.splitext(fname)[1]:
+                local_p += GOOGLE_EXPORT_TYPES[mime][1]
+
+            last_mod = files_state.get(fid, {}).get('modifiedTime', '')
+
+            action = None
+            if not os.path.exists(local_p):
+                self._log(f'新增: {display}', 'new')
+                action = 'new'
+            elif mod != last_mod:
+                self._log(f'更新: {display}', 'update')
+                action = 'update'
+            else:
+                result['unch'] += 1; continue
+
+            try:
+                dl_result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log)
+            except Exception as e:
+                result['err'] += 1
+                reason, hint = self._sync_error_info(e)
+                result['session_err'].append({
+                    'file': display,
+                    'path': local_p,
+                    'reason': reason,
+                    'hint': hint,
+                    'fileId': fid,
+                    'fileName': fname,
+                    'mimeType': mime,
+                    'folderPath': fpath,
+                    'modifiedTime': mod,
+                    'action': action,
+                    'pairName': pname,
+                    'folderId': folder_id,
+                    'downloadPath': dl_path,
+                    'time': datetime.now().isoformat(timespec='seconds'),
+                })
+                self._log(f'  未同步: {display}', 'error')
+                self._log(f'    原因: {reason}', 'error')
+                self._log(f'    建議: {hint}', 'warning')
+                self._log(f'    路徑: {local_p}', 'warning')
+                continue
+
+            if dl_result:
+                self._log(f'  完成: {fname}', 'success')
+                if action == 'new':
+                    result['new'] += 1; result['session_new'].append(display)
+                elif action == 'update':
+                    result['upd'] += 1; result['session_upd'].append(display)
+                files_state[fid] = {
+                    'name': fname, 'folderPath': fpath,
+                    'modifiedTime': mod, 'localPath': dl_result,
+                }
+                result['ok_keys'].add((folder_id, fid))
+
+        save_state(state)
+
+        # 整合圖 XREF 攤平：複製子圖到整合圖那層，讓外部參考解析得到
+        try:
+            fx = flatten_xrefs(dl_path, self._log,
+                               enabled=self.config.get('flatten_xrefs', True))
+            conflicts = fx['conflicts']
+            if fx['copied'] or fx['removed'] or conflicts:
+                self._log(
+                    f"{prefix}套圖連結整理完成  複製: {fx['copied']}  移除失效: {fx['removed']}"
+                    + (f"  ⚠同名衝突: {len(conflicts)}" if conflicts else ''),
+                    'warning' if conflicts else 'success')
+                with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
+                    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    lf.write(f"[{ts}] 套圖連結整理 - 複製: {fx['copied']}, "
+                             f"移除失效: {fx['removed']}, 同名衝突: {len(conflicts)}\n")
+                    for c in conflicts:
+                        lf.write(f"  同名衝突(未複製): {c['folder']}\\{c['name']} "
+                                 f"← {'、'.join(c['sources'])}\n")
+            for c in conflicts:
+                self._log(f"  ⚠同名衝突(未複製): {c['name']}｜{'、'.join(c['sources'])}", 'warning')
+                result['conflicts'].append({**c, 'name': prefix + c['name']})
+        except Exception as e:
+            self._log(f'{prefix}套圖連結整理略過: {e}', 'warning')
+
+        # 孤兒檔處理：雲端已刪/改名的本機殘留檔，移到「回收區」（可還原、非刪除）
+        try:
+            cloud_ids = {f['id'] for f in files}
+            orphans = find_orphans(files_state, cloud_ids, old_paths, dl_path)
+            if orphans:
+                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                if self.config.get('auto_recycle_orphans', True):
+                    date_str = datetime.now().strftime('%Y-%m-%d')
+                    moved, failed = recycle_orphans(orphans, date_str)
+                    self._log(
+                        f'{prefix}已回收 {len(moved)} 個雲端已移除的殘留檔到「{RECYCLE_DIR}/{date_str}」'
+                        + (f'（{len(failed)} 個回收失敗）' if failed else ''), 'warning')
+                    for mv in moved[:10]:
+                        self._log(f'  回收: {mv["rel"]}', 'warning')
+                    for fa in failed:
+                        self._log(f'  回收失敗: {fa["name"]}｜{fa["error"]}', 'error')
+                    with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
+                        lf.write(f"[{ts}] 孤兒檔回收: 移入回收區 {len(moved)} 個, 失敗 {len(failed)} 個\n")
+                        for mv in moved:
+                            lf.write(f"  回收: {mv['rel']} → {os.path.relpath(mv['dest'], dl_path)}\n")
+                    result['orphans_recycled'] = [
+                        {'name': mv['name'], 'rel': prefix + mv['rel'], 'open_path': mv['dest']}
+                        for mv in moved]
+                else:
+                    self._log(f'{prefix}發現 {len(orphans)} 個雲端已移除的殘留檔（未回收）', 'warning')
+                    with open(os.path.join(dl_path, 'update_log.txt'), 'a', encoding='utf-8') as lf:
+                        lf.write(f"[{ts}] 雲端已移除殘留檔: {len(orphans)} 個（未回收）\n")
+                        for o in orphans:
+                            lf.write(f"  殘留: {o['rel']}\n")
+                    result['orphans_report'] = [
+                        {'name': o['name'], 'rel': prefix + o['rel'], 'open_path': o['path']}
+                        for o in orphans]
+        except Exception as e:
+            self._log(f'{prefix}孤兒檔處理略過: {e}', 'warning')
+
+        if result['new'] or result['upd'] or result['err']:
+            self._append_update_log(dl_path, '同步',
+                                    result['new'], result['upd'], result['err'],
+                                    result['session_err'])
+        return result
 
     # ── 今日更新 ──
 
@@ -1939,22 +2295,28 @@ class DriveSyncApp(ctk.CTk):
             self._log('尚未連線，無法重試', 'error'); return
         if not load_history().get('pending'):
             self._log('沒有需要重試的檔案', 'info'); return
-        dl = self.v_path.get().strip() or self.config.get('download_path', '')
-        if not dl:
-            messagebox.showerror('錯誤', '請先設定下載路徑'); return
+        if not enabled_pairs(self.config):
+            messagebox.showerror('錯誤', '請先在「同步資料夾」清單新增至少一個資料夾'); return
         self.is_syncing = True
         self.btn_sync.configure(state='disabled')
         self.btn_retry.configure(state='disabled', text="重試中...")
-        threading.Thread(target=self._retry_worker, args=(dl,), daemon=True).start()
+        threading.Thread(target=self._retry_worker, daemon=True).start()
 
-    def _retry_worker(self, dl_path):
+    def _retry_worker(self):
         try:
             self._log('─' * 40, 'info')
             self._log('開始重試未同步檔案...', 'info')
+            # 舊格式 pending（無 downloadPath/folderId）一律屬於設定清單第一筆
+            # （＝設定升級時的原始資料夾），與 v1 狀態遷移的歸屬一致；
+            # 不可用「第一個啟用中」的，否則主要資料夾停用時檔案會下載到錯的資料夾
+            all_pairs = self.config.get('sync_pairs', [])
+            default_pair = all_pairs[0] if all_pairs else None
             state = load_state()
+            ensure_state_pairs(state, default_pair['folder_id'] if default_pair else '')
             history = load_history()
             pending = history.get('pending', [])
             ok_new, ok_upd, still = [], [], []
+            log_groups = {}   # downloadPath -> {'new':n,'upd':n,'errors':[...]}
 
             for p in pending:
                 fid   = p.get('fileId')
@@ -1962,7 +2324,10 @@ class DriveSyncApp(ctk.CTk):
                 mime  = p.get('mimeType', '')
                 fpath = p.get('folderPath', '')
                 display = p.get('file') or fname
-                if not fid:
+                # 舊版 pending 沒記資料夾歸屬 → 用第一個啟用中的資料夾
+                dl_path = p.get('downloadPath') or (default_pair['download_path'] if default_pair else '')
+                folder_id = p.get('folderId') or (default_pair['folder_id'] if default_pair else '')
+                if not fid or not dl_path or not folder_id:
                     p2 = dict(p)
                     p2['reason'] = '缺少重試資訊，請直接按「立即同步」'
                     still.append(p2)
@@ -1976,17 +2341,22 @@ class DriveSyncApp(ctk.CTk):
                     p2.update({'reason': reason, 'hint': hint,
                                'time': datetime.now().isoformat(timespec='seconds')})
                     still.append(p2)
+                    log_groups.setdefault(dl_path, {'new': 0, 'upd': 0, 'errors': []})['errors'].append(p2)
                     self._log(f'  仍未同步: {display}', 'error')
                     self._log(f'    原因: {reason}', 'error')
                     self._log(f'    建議: {hint}', 'warning')
                     continue
                 if result:
                     self._log(f'  完成: {fname}', 'success')
-                    state['files'][fid] = {
+                    pair_files(state, folder_id)[fid] = {
                         'name': fname, 'folderPath': fpath,
                         'modifiedTime': p.get('modifiedTime', ''), 'localPath': result,
                     }
-                    (ok_new if p.get('action') == 'new' else ok_upd).append(display)
+                    g = log_groups.setdefault(dl_path, {'new': 0, 'upd': 0, 'errors': []})
+                    if p.get('action') == 'new':
+                        ok_new.append(display); g['new'] += 1
+                    else:
+                        ok_upd.append(display); g['upd'] += 1
 
             save_state(state)
             history['pending'] = still
@@ -2001,8 +2371,10 @@ class DriveSyncApp(ctk.CTk):
             self._log('─' * 40, 'info')
             self._log(f'重試完成  成功: {ok_c}  仍失敗: {len(still)}',
                       'warning' if still else 'success')
-            if ok_c or still:
-                self._append_update_log(dl_path, '重試', len(ok_new), len(ok_upd), len(still), still)
+            for dl_path, g in log_groups.items():
+                if g['new'] or g['upd'] or g['errors']:
+                    self._append_update_log(dl_path, '重試', g['new'], g['upd'],
+                                            len(g['errors']), g['errors'])
 
             self._today_new.extend(ok_new)
             self._today_updated.extend(ok_upd)
@@ -2045,24 +2417,35 @@ class DriveSyncApp(ctk.CTk):
 
     def _refresh_files(self):
         state = load_state()
-        dl = self.config.get('download_path', '')
+        pairs = self.config.get('sync_pairs', [])
+        ensure_state_pairs(state, pairs[0]['folder_id'] if pairs else '')
+        multi = len(pairs) > 1
         self._all_files = []
-        for fid, info in state.get('files', {}).items():
-            name = info.get('name', '')
-            folder = info.get('folderPath', '')
-            mod = info.get('modifiedTime', '')
-            try:
-                dt = datetime.fromisoformat(mod.replace('Z', '+00:00'))
-                ts = dt.strftime('%Y-%m-%d %H:%M')
-            except Exception:
-                ts = mod[:19] if mod else '--'
-            # 用目前下載路徑檢查，而非 state 裡的舊路徑
-            if dl:
-                expected = os.path.join(dl, folder, name)
-                exists = os.path.exists(expected)
-            else:
+        for p in pairs:
+            files = state.get('pairs', {}).get(p.get('folder_id', ''), {}).get('files', {})
+            dl = p.get('download_path', '')
+            tag = self._pair_prefix(p, multi)
+            for fid, info in files.items():
+                name = info.get('name', '')
+                folder = info.get('folderPath', '')
+                mod = info.get('modifiedTime', '')
+                try:
+                    dt = datetime.fromisoformat(mod.replace('Z', '+00:00'))
+                    ts = dt.strftime('%Y-%m-%d %H:%M')
+                except Exception:
+                    ts = mod[:19] if mod else '--'
+                # 用目前下載路徑檢查，而非 state 裡的舊路徑
                 exists = False
-            self._all_files.append((folder, name, ts, '已同步' if exists else '遺失'))
+                if dl:
+                    expected = os.path.join(dl, folder, name)
+                    exists = os.path.exists(expected)
+                    if not exists and not os.path.splitext(name)[1]:
+                        # Google 文件類下載時會補上匯出副檔名
+                        for _, ext in GOOGLE_EXPORT_TYPES.values():
+                            if os.path.exists(expected + ext):
+                                exists = True; break
+                self._all_files.append((tag + folder if folder else tag.strip(),
+                                        name, ts, '已同步' if exists else '遺失'))
         self._all_files.sort(key=lambda x: (x[0], x[1]))
         self.v_count.set(f'{len(self._all_files)} 個')
         self._show_files(self._all_files)
