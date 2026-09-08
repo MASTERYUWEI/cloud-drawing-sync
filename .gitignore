@@ -10,6 +10,7 @@ xref_flat_manifest.json
 build/
 dist/
 __pycache__/
+.preview-test/
 .venv/
 venv/
 *.exe

@@ -25,10 +25,18 @@ import customtkinter as ctk
 
 # ==================== 版本 / 自動更新來源 ====================
 
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.2.6'
 GITHUB_OWNER = 'MASTERYUWEI'
 GITHUB_REPO = 'cloud-drawing-sync'
 UPDATE_API_URL = f'https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest'
+
+# Standalone comparison must run before sync-data initialization/migration.
+# The same built executable can replay a local pair without touching login,
+# synchronization state, or the installed desktop application.
+if __name__ == '__main__' and sys.argv[1:2] == ['--compare-session']:
+    from comparison_session import main as compare_session_main
+    compare_session_main(APP_VERSION, sys.argv[2:])
+    raise SystemExit(0)
 
 # ==================== 程式目錄 ====================
 
@@ -1134,6 +1142,14 @@ class DriveSyncApp(ctk.CTk):
         self.btn_sync.pack(side="left")
 
         ctk.CTkButton(
+            bar, text="DWG 版次比較", width=150, height=40, corner_radius=20,
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+            fg_color=Colors.PRIMARY_LIGHT, text_color=Colors.TEXT,
+            hover_color=Colors.APRICOT_HOVER,
+            command=self._open_dwg_compare,
+        ).pack(side="left", padx=(12, 0))
+
+        ctk.CTkButton(
             bar, text="重新載入", width=120, height=38, corner_radius=19,
             font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
             fg_color="transparent", border_width=1, border_color=Colors.SURFACE_ALT,
@@ -1285,6 +1301,12 @@ class DriveSyncApp(ctk.CTk):
                                              font=ctk.CTkFont(family=self.FONT_FAMILY, size=14, weight="bold"),
                                              text_color=Colors.TEXT)
         self.lbl_today_title.pack(side="left", padx=(8, 0))
+
+        ctk.CTkLabel(
+            toolbar, text="　左鍵開啟檔案｜右鍵顯示操作選單",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+            text_color=Colors.TEXT_MUTED,
+        ).pack(side="left")
 
         self.btn_copy = ctk.CTkButton(toolbar, text="複製到剪貼簿", height=34, width=160, corner_radius=17,
                                        font=ctk.CTkFont(family=self.FONT_FAMILY, size=12, weight="bold"),
@@ -2084,6 +2106,111 @@ class DriveSyncApp(ctk.CTk):
             else self._today_collapsed.add(key)
         self._render_today(switch=False)
 
+    def _resolve_today_file(self, folder, name):
+        """把「今日更新」的顯示路徑還原成本機檔案完整路徑。
+
+        歷史紀錄只保存顯示文字；多資料夾同步時路徑會帶有 ``[名稱]``
+        前綴。因此同時嘗試有前綴與舊版無前綴格式，讓程式重開後仍可點擊。
+        """
+        shown = name if folder == '(根目錄)' else os.path.join(folder, name)
+        pairs = self.config.get('sync_pairs', [])
+        candidates = []
+
+        for pair in pairs:
+            root = str(pair.get('download_path') or '').strip()
+            if not root:
+                continue
+
+            rels = []
+            pair_name = (pair.get('name') or pair.get('folder_id', '')[:8])
+            pair_name = pair_name.replace('/', '／').replace('\\', '＼')
+            marker = f'[{pair_name}]'
+            if shown.startswith(marker):
+                rels.append(shown[len(marker):].lstrip(' \\/'))
+            rels.append(shown)
+
+            root_abs = os.path.abspath(root)
+            for rel in rels:
+                if not rel:
+                    continue
+                path = os.path.abspath(os.path.join(root_abs, rel))
+                try:
+                    if os.path.commonpath((root_abs, path)) != root_abs:
+                        continue
+                except ValueError:
+                    continue
+                if path not in candidates:
+                    candidates.append(path)
+
+        # Google 原生文件的顯示名稱可能沒有副檔名，但下載後會補上匯出格式。
+        expanded = []
+        for path in candidates:
+            expanded.append(path)
+            if not os.path.splitext(path)[1]:
+                expanded.extend(path + ext for _, ext in GOOGLE_EXPORT_TYPES.values())
+
+        return next((path for path in expanded if os.path.isfile(path)), None)
+
+    def _open_today_file(self, folder, name):
+        path = self._resolve_today_file(folder, name)
+        if not path:
+            messagebox.showinfo('檔案不存在', f'找不到本機檔案：\n{name}\n\n可能已被移動、改名或刪除。')
+            return 'break'
+        try:
+            os.startfile(path)  # noqa: P204 — 使用 Windows 預設關聯程式開啟
+        except Exception as e:
+            messagebox.showerror('無法開啟檔案', f'{path}\n\n{e}')
+        return 'break'
+
+    def _open_today_folder(self, folder, name):
+        path = self._resolve_today_file(folder, name)
+        if not path:
+            messagebox.showinfo('檔案不存在', f'找不到本機檔案：\n{name}\n\n可能已被移動、改名或刪除。')
+            return 'break'
+        self._open_in_explorer(path)
+        return 'break'
+
+    def _open_dwg_compare(self, initial_new_path=None):
+        """開啟獨立的 DWG 版次比較視窗，不需先執行同步。"""
+        current = getattr(self, '_dwg_compare_window', None)
+        if current is not None and current.winfo_exists():
+            current.deiconify()
+            current.lift()
+            if initial_new_path:
+                current.set_new_path(initial_new_path)
+            return
+        try:
+            from dwg_compare_window import DwgCompareWindow
+            self._dwg_compare_window = DwgCompareWindow(self, initial_new_path)
+        except ImportError:
+            messagebox.showerror(
+                '缺少比較元件',
+                '請重新安裝完整版程式。開發模式請先安裝 requirements.txt 中的套件。')
+
+    def _compare_today_file(self, folder, name):
+        path = self._resolve_today_file(folder, name)
+        if not path:
+            messagebox.showinfo('檔案不存在', f'找不到本機檔案：\n{name}\n\n請確認檔案仍在同步資料夾。')
+            return
+        self._open_dwg_compare(initial_new_path=path)
+
+    def _show_today_file_menu(self, event, folder, name):
+        """在檔名旁顯示右鍵操作選單，不直接執行動作。"""
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(
+            label='開啟所在資料夾',
+            command=lambda f=folder, n=name: self._open_today_folder(f, n))
+        if name.lower().endswith('.dwg'):
+            menu.add_separator()
+            menu.add_command(
+                label='DWG 版次比較…',
+                command=lambda f=folder, n=name: self._compare_today_file(f, n))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
     def _render_today(self, switch=True):
         if not hasattr(self, '_today_collapsed'):
             self._today_collapsed = set()
@@ -2110,7 +2237,7 @@ class DriveSyncApp(ctk.CTk):
             yv = 0.0
         txt.configure(state="normal")
         for t in txt.tag_names():
-            if t.startswith("todayhdr_"):
+            if t.startswith(("todayhdr_", "todayfile_")):
                 txt.tag_delete(t)
         txt.delete("1.0", "end")
 
@@ -2118,6 +2245,7 @@ class DriveSyncApp(ctk.CTk):
         txt.insert("end", f"本次共 {total_files} 個檔案｜{total_groups} 個資料夾\n\n", ("today_dim",))
 
         gid = 0
+        fid = 0
         for si, (title, groups, cnt) in enumerate(sections):
             if si:
                 txt.insert("end", "\n")
@@ -2135,7 +2263,19 @@ class DriveSyncApp(ctk.CTk):
                 txt.tag_bind(htag, "<Leave>", lambda e, w=txt: w.configure(cursor=""))
                 if not collapsed:
                     for idx, name in enumerate(names, 1):
-                        txt.insert("end", f'      {idx:02d}. {name}\n')
+                        ftag = f"todayfile_{fid}"
+                        fid += 1
+                        txt.insert("end", f'      {idx:02d}. ')
+                        txt.insert("end", name, ("today_file", ftag))
+                        txt.insert("end", "\n")
+                        txt.tag_bind(
+                            ftag, "<Button-1>",
+                            lambda e, f=folder, n=name: self._open_today_file(f, n))
+                        txt.tag_bind(
+                            ftag, "<Button-3>",
+                            lambda e, f=folder, n=name: self._show_today_file_menu(e, f, n))
+                        txt.tag_bind(ftag, "<Enter>", lambda e, w=txt: w.configure(cursor="hand2"))
+                        txt.tag_bind(ftag, "<Leave>", lambda e, w=txt: w.configure(cursor=""))
         if not sections:
             txt.insert("end", "本次同步無新增或更新。\n")
         txt.insert("end", f"\n同步時間: {sync_ts.strftime('%H:%M')}\n", ("today_dim",))
@@ -2144,6 +2284,7 @@ class DriveSyncApp(ctk.CTk):
         txt.tag_configure("today_sec", font=(self.FONT_FAMILY, 12, "bold"), foreground=Colors.RUST,
                           spacing1=6, spacing3=4)
         txt.tag_configure("today_folder", font=(self.FONT_FAMILY, 12, "bold"), foreground=Colors.ACCENT)
+        txt.tag_configure("today_file", foreground=Colors.ACCENT, underline=True)
         txt.tag_configure("today_dim", foreground=Colors.TEXT_MUTED)
         txt.configure(state="disabled")
         try:
