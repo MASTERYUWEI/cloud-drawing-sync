@@ -48,7 +48,11 @@ def _find_pdf_plotter(engine: str) -> Path:
     roaming = Path(os.environ.get("APPDATA", "")) / "Autodesk"
     candidates = list(roaming.glob(f"AutoCAD {year}/R*/*/Plotters/*.pc3"))
     candidates.extend(Path(engine).parent.glob("**/Plotters/*.pc3"))
-    preferred = ("dwg to pdf.pc3", "autocad pdf (general documentation).pc3")
+    # SHX text is flattened to device-grid geometry by the plotter. A small
+    # page with the legacy 600-dpi preset destroys tiny letters before the
+    # viewer ever sees them, regardless of subsequent vector zoom quality.
+    preferred = ("autocad pdf (high quality print).pc3",
+                 "autocad pdf (general documentation).pc3", "dwg to pdf.pc3")
     for name in preferred:
         for path in candidates:
             if path.name.lower() == name:
@@ -153,11 +157,26 @@ def _measurement_script(plotter):
 
 
 def _parse_media(text):
-    names = re.findall(r'^\s+"([^"\r\n]*A3[^"\r\n]*)"\s*$', text, re.MULTILINE)
-    candidates = [name for name in names if re.search(r"420[.,]00\s*x\s*297[.,]00", name)]
-    if not candidates:
-        raise PreviewError("AutoCAD PDF 出圖設定沒有可使用的橫向 A3 紙張。")
-    return next((name for name in candidates if "full bleed" in name.lower()), candidates[0])
+    """Prefer a large virtual sheet without enlarging the 4096-pixel preview.
+
+    4A0 has ~5.7 times A3's linear device precision. Together with the high
+    quality PDF preset this preserves small SHX strokes on large projects.
+    Accept either orientation: -PLOT explicitly requests landscape. Only use
+    recognized ISO dimensions so inch sizes/custom roll widths are not guessed.
+    Keep the exact localized media label returned by the installed driver.
+    """
+    names = re.findall(r'^\s+"([^"\r\n]+)"\s*$', text, re.MULTILINE)
+    for short, long in ((1682, 2378), (1189, 1682), (841, 1189),
+                        (594, 841), (420, 594), (297, 420)):
+        candidates = []
+        for name in names:
+            dimensions = re.search(r"\((\d+)[.,]00\s*x\s*(\d+)[.,]00\s+", name)
+            if (name.lower().startswith("iso ") and dimensions
+                    and sorted(map(int, dimensions.groups())) == [short, long]):
+                candidates.append((name, int(dimensions.group(1)) >= int(dimensions.group(2))))
+        if candidates:
+            return min(candidates, key=lambda item: ("full bleed" not in item[0].lower(), not item[1]))[0]
+    raise PreviewError("AutoCAD PDF 出圖設定沒有可使用的 ISO A3 或更大紙張。")
 
 
 def _parse_measurement(text: str, label: str) -> dict:
@@ -274,6 +293,11 @@ def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None) -
         media = media or _parse_media(text)
         measured.append(measurement)
         warnings.extend(measurement["warnings"])
+    report(f"細字保真轉換：{plotter.name}；虛擬紙張 {media}（不變更 DWG 或印表機設定）。")
+    if plotter.name.lower() != "autocad pdf (high quality print).pc3":
+        warnings.append("未找到高品質 PDF 出圖設定，已使用可用設定；大型圖面的細字精度可能較低。")
+    if not re.search(r"\b4A0\b", media, re.I):
+        warnings.append(f"出圖設定未提供 4A0 虛擬紙張，已改用 {media}；極小文字放大後仍可能失真。")
     if measured[0]["units"] != measured[1]["units"]:
         raise PreviewError("兩版 DWG 的圖面單位不同，請先在 AutoCAD 確認單位後再比較。")
     bounds = _common_bounds(measured[0]["bounds"], measured[1]["bounds"])

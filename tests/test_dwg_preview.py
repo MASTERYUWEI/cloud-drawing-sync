@@ -22,6 +22,36 @@ class PreviewChecks(unittest.TestCase):
         text = '\n  "ISO full bleed A3 (297.00 x 420.00 公釐)"\n  "ISO full bleed A3 (420.00 x 297.00 公釐)"\n'
         self.assertEqual(preview._parse_media(text), "ISO full bleed A3 (420.00 x 297.00 公釐)")
 
+    def test_large_virtual_sheet_preserves_tiny_text_precision(self):
+        text = '\n'.join('  "' + name + '"' for name in (
+            'ISO full bleed A3 (420.00 x 297.00 MM)',
+            'ISO full bleed A0 (841.00 x 1189.00 MM)',
+            'ISO 4A0 (1682.00 x 2378.00 MM)',
+            'ISO full bleed 4A0 (1682.00 x 2378.00 公釐)'))
+        self.assertEqual(preview._parse_media(text), 'ISO full bleed 4A0 (1682.00 x 2378.00 公釐)')
+
+    def test_media_fallback_accepts_portrait_and_decimal_comma(self):
+        self.assertEqual(preview._parse_media('\n  "ISO full bleed A1 (594,00 x 841,00 mm)"\n'),
+                         'ISO full bleed A1 (594,00 x 841,00 mm)')
+        with self.assertRaises(preview.PreviewError):
+            preview._parse_media('\n  "ANSI A (11.00 x 8.50 Inches)"\n')
+
+    def test_high_quality_plotter_preferred_and_legacy_fallback_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plotters = root / 'Autodesk' / 'AutoCAD 2024' / 'R24.3' / 'cht' / 'Plotters'
+            plotters.mkdir(parents=True)
+            legacy = plotters / 'DWG To PDF.pc3'
+            general = plotters / 'AutoCAD PDF (General Documentation).pc3'
+            sharp = plotters / 'AutoCAD PDF (High Quality Print).pc3'
+            with patch.dict(preview.os.environ, {'APPDATA': tmp}):
+                legacy.touch()
+                self.assertEqual(preview._find_pdf_plotter(str(root / 'engine' / 'AutoCAD 2024' / 'accoreconsole.exe')), legacy)
+                general.touch()
+                self.assertEqual(preview._find_pdf_plotter(str(root / 'engine' / 'AutoCAD 2024' / 'accoreconsole.exe')), general)
+                sharp.touch()
+                self.assertEqual(preview._find_pdf_plotter(str(root / 'engine' / 'AutoCAD 2024' / 'accoreconsole.exe')), sharp)
+
     def test_cancel_before_any_files_or_processes(self):
         event = threading.Event()
         event.set()

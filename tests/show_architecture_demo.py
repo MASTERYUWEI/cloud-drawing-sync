@@ -14,7 +14,7 @@ if __name__ == "__main__":
     root = ctk.CTk()
     root.withdraw()
     window = DwgCompareWindow(root, data["new_dwg"])
-    window.title("DWG 圖面變更比對 v1.2.6 · 全螢幕看圖測試")
+    window.title("DWG 圖面變更比對 v1.2.7 · 全螢幕看圖測試")
     window._old_path.set(data["old_dwg"])
     window._set_controls()
     window.protocol("WM_DELETE_WINDOW", root.destroy)
