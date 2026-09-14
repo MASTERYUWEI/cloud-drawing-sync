@@ -11,6 +11,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import customtkinter as ctk
 from dwg_compare_window import DwgCompareWindow, _read_preview
+from comparison_regions import ComparisonRegions
+from drawing_diff import compare_previews
 
 
 def main():
@@ -23,6 +25,12 @@ def main():
     window._canvas_size = (1918, 1002)
     window._originals = tuple(_read_preview(report[k]) for k in ("new_png", "old_png"))
     window._pdfs = tuple(Path(report[k]).read_bytes() for k in ("new_pdf", "old_pdf"))
+    if "--no-refine" not in sys.argv:
+        masks = compare_previews(*window._originals, tolerance=0, include_regions=False)
+        window._region_index = ComparisonRegions.from_masks(masks["added_mask"], masks["removed_mask"])
+        window._regions, window._region_total = window._region_index.regions()
+        window._populate_regions()
+        del masks
     window._mode.set("左右滑桿")
     window._generation += 1
     window._scale = 1.5
@@ -57,6 +65,7 @@ def main():
             quality = window._display_signature[5]
             pump(settled)
             print(json.dumps({"target_percent": target*100, "readable_ms": round(readable,2),
+                              "regions": len(window._regions),
                               "first_quality": quality, "final_ms": round((time.perf_counter()-start)*1000,2)}), flush=True)
     finally:
         window.destroy()

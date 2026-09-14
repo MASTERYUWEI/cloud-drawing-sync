@@ -68,7 +68,7 @@ class PreviewChecks(unittest.TestCase):
             new.write_bytes(b"new")
             output = '\nCDS_EXTENTS|0|0|10|10\nCDS_UNITS|4\nCDS_MEASURE_DONE\n  "ISO A3 (420.00 x 297.00 MM)"\n'
 
-            def fake_console(*args):
+            def fake_console(*args, **kwargs):
                 new.write_bytes(b"updated during synchronization")
                 return output
 

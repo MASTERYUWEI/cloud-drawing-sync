@@ -42,7 +42,7 @@ def _neutral(ink):
                       for value in range(256)]).convert('RGB')
 
 
-def _regions(added, removed):
+def _regions(added, removed, *, cell_size=None):
     """Connected components on a <=256-ish-cell-wide occupancy grid.
 
     Pillow reduction keeps even a single changed pixel (cell area <=256).
@@ -51,7 +51,7 @@ def _regions(added, removed):
     Only the list is capped; neither change mask is filtered or capped.
     """
     width, height = added.size
-    cell = max(4, min(16, math.ceil(max(width, height) / 256)))
+    cell = cell_size or max(4, min(16, math.ceil(max(width, height) / 256)))
     occupancy = ImageChops.lighter(added, removed).reduce(cell)
     # One empty grid cell may separate segments of the same local change.
     # Bridge that gap for a manageable navigation list, not for the ink masks.

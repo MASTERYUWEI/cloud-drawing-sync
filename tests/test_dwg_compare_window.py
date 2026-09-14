@@ -90,6 +90,27 @@ class CompareWindowWorkflow(unittest.TestCase):
         self.assertFalse(self.generated_directory.exists())
         self.assertTrue(all(self.window._pdfs))
 
+    def test_failed_conversion_report_can_be_copied_after_temp_cleanup(self):
+        def fail(*args, **kwargs):
+            kwargs['diagnostics'].note(stage='舊版：PDF 出圖', media='ISO 4A0', exit_code=0)
+            kwargs['diagnostics'].console('Invalid plot configuration')
+            raise RuntimeError('出圖失敗')
+        with patch('dwg_preview.render_dwg_pair', side_effect=fail), \
+                patch.object(self.window, '_show_error_report') as dialog:
+            self.window._start_render()
+            self.pump_until(lambda: not self.window._busy)
+            dialog.assert_called_once()
+            message, report = dialog.call_args.args
+            self.assertIn('Invalid plot configuration', report)
+            self.assertIn('ISO 4A0', report)
+            self.assertNotIn(self.temp.name, report)
+            self.window._last_error_report = report
+            with patch.object(self.window, 'clipboard_clear') as clear, \
+                    patch.object(self.window, 'clipboard_append') as append:
+                self.assertTrue(self.window._copy_error_report())
+                clear.assert_called_once()
+                append.assert_called_once_with(report)
+
     def test_swap_reverses_red_and_green_and_preserves_vectors(self):
         self.load_fixture()
         old_pdfs = self.window._pdfs
@@ -101,6 +122,68 @@ class CompareWindowWorkflow(unittest.TestCase):
         self.assertIsNot(self.window._tile_cache, old_cache)
         self.assertIsNone(ImageChops.difference(before["added_mask"], self.window._viewport_diff["removed_mask"]).getbbox())
         self.assertIsNone(ImageChops.difference(before["removed_mask"], self.window._viewport_diff["added_mask"]).getbbox())
+
+    def test_refined_bounds_reach_tree_without_moving_selected_camera(self):
+        self.load_fixture()
+        win = self.window
+        win._region_tree.selection_set("0")
+        self.pump_until(lambda: win._selected_region == 0)
+        self.pump_until(lambda: win._frame_matches(win._view_signature()))
+        camera = (win._scale, win._offset)
+        regions = [dict(region) for region in win._regions]
+        x0, y0, x1, y1 = regions[0]["bbox"]
+        regions[0]["bbox"] = (x0, y0, x1 + 100, y1)
+        win._accept_region_refinement(win._region_index, regions, len(regions))
+        self.root.update()
+        self.assertEqual((win._scale, win._offset), camera)
+        self.assertEqual(win._region_tree.selection(), ("0",))
+        self.assertEqual(win._regions[0]["bbox"][2], x1 + 100)
+        win._invalidate_preview()
+        self.assertIsNone(win._region_index)
+
+    def test_obsolete_drawing_refinement_is_not_accepted(self):
+        self.load_fixture()
+        win = self.window
+        index = win._region_index
+        signature = win._view_signature()
+        win._generation += 1
+        win._events.put((win._job_id, "viewport", (signature, None,
+                         {"region_refinement": (None, [], 0)}, None)))
+        win.after_cancel(win._poll_id)
+        win._poll_id = None
+        win._poll_worker()
+        self.assertIs(win._region_index, index)
+        self.assertTrue(win._regions)
+
+    def test_deep_zoom_updates_actual_region_list_from_visible_vector_changes(self):
+        from comparison_regions import ComparisonRegions
+        from PIL import Image
+        win = self.window
+        win._originals = (Image.new("RGB", (1000, 700), "white"),) * 2
+        win._pdfs = (
+            make_pdf("0 0 0 RG 0.01 w 100 399.8 m 120 399.8 l S"),
+            make_pdf("0 0 0 RG 0.01 w 100 399.72 m 120 399.72 l S"))
+        blank = Image.new("L", (1000, 700), 0)
+        win._region_index = ComparisonRegions.from_masks(blank, blank)
+        win._scale, win._offset = 128, (-12800, -38370)
+        win._fit_mode = False
+        win._schedule_render()
+        self.pump_until(lambda: win._frame_matches(win._view_signature()))
+        self.assertEqual(len(win._regions), 1)
+        first_right = win._regions[0]["bbox"][2]
+        self.assertEqual(win._region_tree.item("0", "values"), ("新增＋刪除",))
+        win._offset = (-13500, -38370)
+        win._schedule_render()
+        self.pump_until(lambda: win._frame_matches(win._view_signature()))
+        self.assertEqual(len(win._regions), 1)
+        self.assertGreater(win._regions[0]["bbox"][2], first_right)
+        a, b, c, d = win._regions[0]["bbox"]
+        for name in ("added_mask", "removed_mask"):
+            x0, y0, x1, y1 = win._viewport_diff[name].getbbox()
+            self.assertLessEqual(a, (x0 + 13500) / 128)
+            self.assertLessEqual(b, (y0 + 38370) / 128)
+            self.assertGreaterEqual(c, (x1 + 13500) / 128)
+            self.assertGreaterEqual(d, (y1 + 38370) / 128)
 
     def test_region_selection_zoom_and_rapid_pan_use_latest_view(self):
         self.load_fixture()
@@ -179,6 +262,25 @@ class CompareWindowWorkflow(unittest.TestCase):
                   for item in self.window._canvas.find_withtag("overlay")
                   if self.window._canvas.type(item) == "text"]
         self.assertIn(f"{len(self.window._regions):02d}", labels)
+
+    def test_clouds_are_lines_not_rectangles_and_visibility_toggle_works(self):
+        self.load_fixture()
+        win = self.window
+        win._draw()
+        clouds = win._canvas.find_withtag("change-cloud")
+        self.assertTrue(clouds)
+        self.assertTrue(all(win._canvas.type(item) == "line" for item in clouds))
+        win._show_regions.set(False)
+        win._draw()
+        self.assertFalse(win._canvas.find_withtag("change-cloud"))
+        win._selected_region = 0
+        win._draw()
+        self.assertTrue(win._canvas.find_withtag("change-cloud"))
+        win._mode.set("舊版原圖")
+        win._on_mode()
+        self.pump_until(lambda: win._frame_matches(win._view_signature()))
+        win._draw()
+        self.assertFalse(win._canvas.find_withtag("change-cloud"))
 
     def test_pan_uses_fast_tiles_then_refines_after_release(self):
         self.load_fixture()

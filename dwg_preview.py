@@ -91,7 +91,29 @@ def _check_cancel(cancel_event):
         raise PreviewCancelled("已取消版次預覽。")
 
 
-def _run_console(engine, source, script, job, cancel_event=None, timeout=180):
+def _run_console(engine, source, script, job, cancel_event=None, timeout=180, diagnostics=None):
+    if diagnostics is not None:
+        diagnostics.note(exit_code='not started', pdf_exists='not checked',
+                         pdf_bytes='not checked', plot_done='not checked')
+    before = set(job.glob('*.log')) if diagnostics is not None else set()
+    try:
+        return _run_console_impl(engine, source, script, job, cancel_event, timeout, diagnostics)
+    finally:
+        if diagnostics is not None:
+            try:
+                for path in sorted(set(job.glob('*.log')) - before):
+                    with path.open('rb') as stream:
+                        length = stream.seek(0, 2)
+                        stream.seek(0)
+                        head = stream.read(4096) if length > 65536 else b''
+                        stream.seek(max(0, length - 65536) // 2 * 2)
+                        tail = _decode_console(stream.read(65536))
+                        diagnostics.console((_decode_console(head) + '\n[log truncated]\n' if head else '') + tail)
+            except OSError as exc:
+                diagnostics.note(log_capture_error=type(exc).__name__)
+
+
+def _run_console_impl(engine, source, script, job, cancel_event=None, timeout=180, diagnostics=None):
     """Only terminate the process this invocation owns, never acad.exe."""
     _check_cancel(cancel_event)
     script_path = job / (uuid.uuid4().hex + ".scr")
@@ -123,6 +145,8 @@ def _run_console(engine, source, script, job, cancel_event=None, timeout=180):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=10)
+            if diagnostics is not None:
+                diagnostics.note(exit_code=process.returncode)
     text = _decode_console(output_path.read_bytes())
     if process.returncode != 0:
         raise PreviewError(f"AutoCAD 無法讀取「{source.name}」（代碼 {process.returncode}），請確認圖檔及 AutoCAD 啟用狀態。")
@@ -248,7 +272,7 @@ def _rasterize(pdf: Path, png: Path, max_side=4096):
         raise PreviewError(f"無法轉換 AutoCAD 預覽：{exc}") from exc
 
 
-def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None) -> dict:
+def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None, diagnostics=None) -> dict:
     """Return {old_png, new_png, old_pdf, new_pdf, warnings} aligned previews.
 
     The source files and active AutoCAD session are never modified.  Output and
@@ -262,9 +286,14 @@ def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None) -
         if source.suffix.lower() != ".dwg" or not source.is_file():
             raise PreviewError(f"找不到 DWG 圖檔：{source}")
     engine = find_core_console()
+    if diagnostics is not None:
+        diagnostics.note(stage='尋找 AutoCAD', engine=engine or 'not found')
     if not engine:
         raise PreviewError("DWG 預覽需要本機安裝並啟用 AutoCAD。")
     plotter = _find_pdf_plotter(engine)
+    if diagnostics is not None:
+        year = re.search(r'AutoCAD (\d{4})', engine)
+        diagnostics.note(autocad_year=year.group(1) if year else 'unknown', plotter=plotter.name)
     try:
         import pypdfium2  # noqa: F401 -- fail early before starting AutoCAD
     except ImportError as exc:
@@ -288,9 +317,13 @@ def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None) -
     for source, label in zip(sources, ("舊版", "新版")):
         report(f"正在讀取{label}圖面範圍：{source.name}")
         check_sources()
-        text = _run_console(engine, source, _measurement_script(plotter), job, cancel_event)
+        if diagnostics is not None:
+            diagnostics.note(stage=label + '：讀取範圍／紙張')
+        text = _run_console(engine, source, _measurement_script(plotter), job, cancel_event, diagnostics=diagnostics)
         measurement = _parse_measurement(text, label)
         media = media or _parse_media(text)
+        if diagnostics is not None:
+            diagnostics.note(media=media, units=measurement['units'])
         measured.append(measurement)
         warnings.extend(measurement["warnings"])
     report(f"細字保真轉換：{plotter.name}；虛擬紙張 {media}（不變更 DWG 或印表機設定）。")
@@ -309,10 +342,17 @@ def render_dwg_pair(old_path, new_path, work_dir, log=None, cancel_event=None) -
         check_sources()
         report(f"正在產生{label}預覽：{source.name}")
         pdf, png = job / f"{stem}.pdf", job / f"{stem}.png"
-        text = _run_console(engine, source, _plot_script(bounds, plotter, pdf, media), job, cancel_event)
+        if diagnostics is not None:
+            diagnostics.note(stage=label + '：PDF 出圖')
+        text = _run_console(engine, source, _plot_script(bounds, plotter, pdf, media), job, cancel_event, diagnostics=diagnostics)
+        if diagnostics is not None:
+            diagnostics.note(pdf_exists=pdf.is_file(), pdf_bytes=pdf.stat().st_size if pdf.is_file() else 0,
+                             plot_done='\nCDS_PLOT_DONE' in text)
         if not pdf.is_file() or pdf.stat().st_size < 100 or "\nCDS_PLOT_DONE" not in text:
             raise PreviewError(f"{label}出圖失敗，請確認 AutoCAD 的 PDF 出圖設定。")
         _check_cancel(cancel_event)
+        if diagnostics is not None:
+            diagnostics.note(stage=label + '：PDF 轉預覽')
         _rasterize(pdf, png)
         paths.append(str(png))
     _check_cancel(cancel_event)

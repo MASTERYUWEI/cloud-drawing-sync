@@ -19,6 +19,9 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 from PIL import Image, ImageTk
 from comparison_tiles import ComparisonTileCache, TileRenderCancelled
+from comparison_regions import ComparisonRegions
+from change_outline import change_contours, cloud_paths
+from comparison_diagnostics import ComparisonDiagnostics
 from pdf_viewport import max_view_scale
 
 
@@ -94,6 +97,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self.bind("<Destroy>", self._on_destroy, add="+")
 
         self._closed = False
+        self._last_error_report = ""
+        self._error_dialog = None
         self._busy = False
         self._worker = None
         self._cancel_event = threading.Event()
@@ -106,6 +111,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._views = None
         self._viewport_diff = None
         self._regions = []
+        self._region_index = None
+        self._region_total = 0
         self._selected_region = None
         self._generation = 0
         self._display_signature = None
@@ -234,7 +241,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         for label, color in (("  ● 刪除", "#C83232"), ("  ● 新增", "#00894F"), ("  ● 未變更", "#777777")):
             ctk.CTkLabel(modes, text=label, text_color=color,
                          font=("Microsoft JhengHei UI", 12, "bold")).pack(side="left", padx=3)
-        ctk.CTkCheckBox(modes, text="標出差異位置", variable=self._show_regions,
+        ctk.CTkCheckBox(modes, text="差異雲形線", variable=self._show_regions,
                         command=self._schedule_render, width=115, checkbox_width=18,
                         checkbox_height=18, fg_color=RUST).pack(side="right", padx=6)
 
@@ -319,7 +326,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._status_label.grid(row=1, column=0, sticky="ew")
         ctk.CTkLabel(
             footer,
-            text="模型空間視覺比對，需相同座標與單位；清單依全圖預覽偵測，請放大複核細節。XREF 使用目前可讀取版本。",
+            text="模型空間視覺比對，需相同座標與單位；放大／平移時補全變更框，未查看的細微差異仍須複核。XREF 使用目前可讀取版本。",
             text_color=MUTED, anchor="w", font=("Microsoft JhengHei UI", 11),
         ).grid(row=2, column=0, sticky="ew")
         self._log = ctk.CTkTextbox(footer, height=48, fg_color="#F1EFEC",
@@ -327,6 +334,9 @@ class DwgCompareWindow(ctk.CTkToplevel):
                                   font=("Microsoft JhengHei UI", 11), wrap="word")
         self._log.grid(row=3, column=0, pady=(4, 0), sticky="ew")
         self._log.configure(state="disabled")
+        self._error_copy_button = ctk.CTkButton(footer, text="複製錯誤報告", width=125,
+                                               state="disabled", command=self._copy_error_report)
+        self._error_copy_button.grid(row=4, column=0, sticky="e", pady=(4, 0))
         self._make_fullscreen_controls()
 
     def _make_fullscreen_controls(self):
@@ -490,8 +500,11 @@ class DwgCompareWindow(ctk.CTkToplevel):
             if self._pdfs:
                 self._pdfs = self._pdfs[::-1]
             for region in self._regions:
-                region["added_pixels"], region["removed_pixels"] = region["removed_pixels"], region["added_pixels"]
+                count = "cells" if "added_cells" in region else "pixels"
+                region[f"added_{count}"], region[f"removed_{count}"] = region[f"removed_{count}"], region[f"added_{count}"]
                 region["kind"] = {"added": "removed", "removed": "added", "changed": "changed"}[region["kind"]]
+            if self._region_index is not None:
+                self._region_index = self._region_index.swapped()
             self._generation += 1
             self._viewport_cancel.set()
             self._tile_cache = None
@@ -512,6 +525,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._views = None
         self._viewport_diff = None
         self._regions = []
+        self._region_index = None
+        self._region_total = 0
         self._selected_region = None
         self._display_signature = None
         self._failed_signature = None
@@ -555,8 +570,28 @@ class DwgCompareWindow(ctk.CTkToplevel):
         for index, region in enumerate(self._regions):
             self._region_tree.insert("", "end", iid=str(index), text=f"{index + 1:02d}",
                                       values=(kinds[region["kind"]],), tags=(region["kind"],))
-        self._region_summary.configure(text=f"視覺差異：{len(self._regions)} 個區域" if self._originals else "視覺差異區域")
+        limited = f"（共 {self._region_total} 區，清單上限 200）" if self._region_total > len(self._regions) else ""
+        self._region_summary.configure(text=f"已偵測：{len(self._regions)} 區{limited}\n放大／平移時補全範圍" if self._originals else "視覺差異區域")
+        if self._selected_region is not None and self._selected_region < len(self._regions):
+            self._region_tree.selection_set(str(self._selected_region))
         self._update_focus_region()
+
+    def _accept_region_refinement(self, index, regions, total):
+        """Keep the selected location when components join; never auto-pan."""
+        selected = self._selected_region
+        if selected is not None and selected < len(self._regions):
+            x0, y0, x1, y1 = self._regions[selected]["bbox"]
+            def overlap(region):
+                a, b, c, d = region["bbox"]
+                return max(0, min(x1, c) - max(x0, a)) * max(0, min(y1, d) - max(y0, b))
+            selected = max(range(len(regions)), key=lambda i: overlap(regions[i]), default=None)
+            if selected is not None and not overlap(regions[selected]):
+                selected = None
+        self._selected_region = selected
+        self._region_index, self._regions, self._region_total = index, regions, total
+        self._populate_regions()
+        self._set_controls()
+        self._status.set(f"已補全差異範圍：{total} 個視覺區域；相連變更會合併。尚未查看的細微差異仍須放大複核；轉換提醒請查看紀錄。")
 
     def _update_focus_region(self):
         index = self._selected_region
@@ -568,7 +603,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         if not selected or not self._originals:
             return
         index = int(selected[0])
-        if index >= len(self._regions):
+        if index >= len(self._regions) or index == self._selected_region:
             return
         self._stop_zoom_animation()
         self._selected_region = index
@@ -608,6 +643,50 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._log.see("end")
         self._log.configure(state="disabled")
 
+    def _copy_error_report(self):
+        if not self._last_error_report:
+            return False
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self._last_error_report)
+        except tk.TclError:
+            self._status.set("無法複製，請在錯誤視窗內選取文字後按 Ctrl+C。")
+            return False
+        self._status.set("已複製錯誤報告，請確認內容後貼給開發者。")
+        return True
+
+    def _show_error_report(self, message, report):
+        self._last_error_report = report
+        self._error_copy_button.configure(state="normal")
+        if self._error_dialog is not None and self._error_dialog.winfo_exists():
+            self._error_dialog.destroy()
+        dialog = ctk.CTkToplevel(self)
+        self._error_dialog = dialog
+        dialog.title("DWG 比較失敗 — 複製錯誤報告")
+        dialog.geometry("780x560")
+        dialog.minsize(620, 420)
+        dialog.transient(self)
+        dialog.attributes("-topmost", True)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(2, weight=1)
+        ctk.CTkLabel(dialog, text=message, wraplength=720, justify="left").grid(
+            row=0, column=0, padx=20, pady=(16, 8), sticky="w")
+        ctk.CTkLabel(dialog, text="請按「複製錯誤報告」貼給開發者。傳送前請確認沒有敏感專案文字。\n不會自動上傳圖檔或傳送報告。",
+                    wraplength=720, justify="left").grid(row=1, column=0, padx=20, sticky="w")
+        textbox = ctk.CTkTextbox(dialog, wrap="word")
+        textbox.grid(row=2, column=0, padx=20, pady=12, sticky="nsew")
+        textbox.insert("1.0", report)
+        textbox.configure(state="disabled")
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=3, column=0, padx=20, pady=(0, 16), sticky="e")
+        button = ctk.CTkButton(actions, text="複製錯誤報告")
+        def copy():
+            if self._copy_error_report():
+                button.configure(text="已複製，可貼上回傳")
+        button.configure(command=copy)
+        button.pack(side="left", padx=8)
+        ctk.CTkButton(actions, text="關閉", command=dialog.destroy, width=80).pack(side="left")
+
     def _start_render(self):
         if self._busy or self._closed:
             return
@@ -644,12 +723,13 @@ class DwgCompareWindow(ctk.CTkToplevel):
             directory = None
             result = None
             error = None
+            diagnostics = ComparisonDiagnostics((old_path, new_path))
             try:
                 from dwg_preview import render_dwg_pair
                 directory = tempfile.TemporaryDirectory(prefix="cloud-dwg-compare-")
                 rendered = render_dwg_pair(
                     old_path, new_path, directory.name,
-                    log=report, cancel_event=cancel_event)
+                    log=report, cancel_event=cancel_event, diagnostics=diagnostics)
                 if not cancel_event.is_set():
                     old_image = _read_preview(rendered["old_png"])
                     new_image = _read_preview(rendered["new_png"])
@@ -658,14 +738,15 @@ class DwgCompareWindow(ctk.CTkToplevel):
                     from drawing_diff import compare_previews
                     report("正在偵測線條新增與刪除，建立可定位的差異清單…")
                     differences = compare_previews(old_image, new_image, tolerance=0)
+                    region_index = ComparisonRegions.from_masks(differences["added_mask"], differences["removed_mask"])
                     pdfs = (Path(rendered["old_pdf"]).read_bytes(),
                             Path(rendered["new_pdf"]).read_bytes())
                     warnings = list(rendered.get("warnings") or [])
                     if differences.get("regions_truncated"):
                         warnings.append("差異區域較多，清單僅列出前 200 區；圖面仍顯示所有差異。")
-                    result = (old_image, new_image, warnings, pdfs, differences["regions"])
+                    result = (old_image, new_image, warnings, pdfs, region_index)
             except Exception as exc:
-                error = str(exc) or type(exc).__name__
+                error = {"message": str(exc) or type(exc).__name__, "report": diagnostics.report(exc)}
             finally:
                 if directory is not None:
                     try:
@@ -711,6 +792,9 @@ class DwgCompareWindow(ctk.CTkToplevel):
                                 self._view_dirty = False
                             self._schedule_render()
                         elif differences is not None and not self._frame_matches(signature):
+                            refinement = differences.pop("region_refinement", None)
+                            if refinement is not None:
+                                self._accept_region_refinement(*refinement)
                             self._views, self._viewport_diff = views, differences
                             self._display_signature = signature
                             self._view_dirty = False
@@ -728,9 +812,11 @@ class DwgCompareWindow(ctk.CTkToplevel):
                 self._progress.stop()
                 self._progress.set(0)
                 if kind == "ready":
-                    old_image, new_image, warnings, pdfs, regions = value
+                    old_image, new_image, warnings, pdfs, region_index = value
                     self._originals = (old_image, new_image)
                     self._pdfs = pdfs
+                    self._region_index = region_index
+                    regions, self._region_total = region_index.regions()
                     self._regions = regions
                     self._generation += 1
                     self._populate_regions()
@@ -741,7 +827,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
                                       if regions else "全圖預覽未偵測到線條位置差異；仍可放大檢查細節。")
                                      + (" 另有轉換提醒，請查看紀錄。" if warnings else ""))
                     self._append_log("比對完成：紅色＝舊版才有（刪除）；綠色＝新版才有（新增）；灰色＝相同。")
-                    self._append_log("差異清單依全圖預覽偵測，不是 CAD 圖元清單；不忽略相鄰像素位移。放大時會重新繪製向量預覽。")
+                    self._append_log("差異框先依全圖預覽建立，放大／平移時依可見紅綠差異補全並合併相連區域；尚未查看的極細微變更可能未列出。清單不是 CAD 圖元清單。")
                     for warning in warnings:
                         self._append_log("提醒：" + str(warning))
                 elif kind == "cancelled":
@@ -749,8 +835,10 @@ class DwgCompareWindow(ctk.CTkToplevel):
                     self._append_log("使用者已取消此次轉換。")
                 else:
                     self._status.set("無法產生比較；請查看下方原因後重試。")
-                    self._append_log(value)
-                    messagebox.showerror("DWG 比較無法完成", value, parent=self)
+                    message = value["message"] if isinstance(value, dict) else str(value)
+                    report = value["report"] if isinstance(value, dict) else ComparisonDiagnostics().report(RuntimeError(message))
+                    self._append_log(message)
+                    self._show_error_report(message, report)
                 self._set_controls()
         except queue.Empty:
             pass
@@ -964,6 +1052,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         if pdfs and self._tile_cache is None:
             self._tile_cache = ComparisonTileCache(pdfs, reference_width=originals[0].width)
         cache = self._tile_cache
+        region_index = self._region_index
+        existing_regions = tuple(dict(region) for region in self._regions)
         job_id = self._job_id
 
         def render():
@@ -977,6 +1067,33 @@ class DwgCompareWindow(ctk.CTkToplevel):
                                   for index, im in enumerate(originals))
                     differences = (compare_visible_layers(*views, mode) if mode in ("overlay", "swipe")
                                    else {})
+                if cancel_event.is_set():
+                    raise TileRenderCancelled()
+                regions = existing_regions
+                outline_index = region_index
+                if region_index is not None and "added_mask" in differences:
+                    refined = region_index.refine(differences["added_mask"], differences["removed_mask"], scale, offset)
+                    outline_index = refined
+                    if refined is not region_index:
+                        regions, total = refined.regions()
+                        differences["region_refinement"] = (refined, regions, total)
+                if "added_mask" in differences:
+                    interior_hint = outline_index.interior_hint(size, scale, offset) if outline_index is not None else None
+                    outlines = change_contours(differences["added_mask"], differences["removed_mask"], interior_hint=interior_hint)
+                    annotated = []
+                    for contour in outlines:
+                        xs, ys = zip(*contour)
+                        box = ((min(xs)-offset[0])/scale, (min(ys)-offset[1])/scale,
+                               (max(xs)-offset[0])/scale, (max(ys)-offset[1])/scale)
+                        def overlap(region):
+                            a,b,c,d = region["bbox"]
+                            area = max(0, min(c,box[2])-max(a,box[0])) * max(0, min(d,box[3])-max(b,box[1]))
+                            return area / max(1e-12, (c-a)*(d-b))
+                        number = max(range(len(regions)), key=lambda i: overlap(regions[i]), default=None)
+                        if number is not None and not overlap(regions[number]):
+                            number = None
+                        annotated.append((number, contour))
+                    differences["change_contours"] = annotated
                 if cancel_event.is_set():
                     raise TileRenderCancelled()
                 return signature, views, differences, None
@@ -1086,19 +1203,24 @@ class DwgCompareWindow(ctk.CTkToplevel):
         if self.focus_get() not in (self._zoom_entry._entry, self._focus_zoom_entry._entry):
             self._update_zoom_text()
         if mode in ("差異疊圖", "左右滑桿"):
-            for index, region in enumerate(self._regions):
-                if not self._show_regions.get() and index != self._selected_region:
+            ratio = self._scale / source_scale
+            cloud_offset = tuple(a-b*ratio for a,b in zip(self._offset, source_offset))
+            labelled = set()
+            for index, contour in self._viewport_diff.get("change_contours", ()):
+                selected = index is not None and index == self._selected_region
+                if not self._show_regions.get() and not selected:
                     continue
-                x0, y0, x1, y1 = region["bbox"]
-                left, top = x0 * self._scale + self._offset[0] - 5, y0 * self._scale + self._offset[1] - 5
-                right, bottom = x1 * self._scale + self._offset[0] + 5, y1 * self._scale + self._offset[1] + 5
-                if right < 0 or bottom < 0 or left > width or top > height:
-                    continue
-                color = ACCENT if index == self._selected_region else {
-                    "added": "#00894F", "removed": "#C83232", "changed": "#AD701E"}[region["kind"]]
-                self._canvas.create_rectangle(left, top, right, bottom, outline=color,
-                                               width=1, dash=(5, 4), tags="overlay")
-                self._canvas.create_text(max(14, min(width-14, left)), max(12, min(height-12, top-9)),
+                kind = self._regions[index]["kind"] if index is not None and index < len(self._regions) else "changed"
+                color = ACCENT if selected else {
+                    "added": "#00894F", "removed": "#C83232", "changed": "#AD701E"}[kind]
+                paths = cloud_paths(contour, ratio, cloud_offset, (width, height))
+                for path in paths:
+                    self._canvas.create_line(*[n for point in path for n in point], fill=color,
+                                             width=1.5 if selected else 1, tags=("overlay", "change-cloud"))
+                if paths and index is not None and index not in labelled:
+                    labelled.add(index)
+                    left, top = min((point for path in paths for point in path), key=lambda p: (p[1], p[0]))
+                    self._canvas.create_text(max(14, min(width-14, left)), max(12, min(height-12, top-9)),
                                           text=f"{index+1:02d}", anchor="w", fill=color,
                                           font=("Microsoft JhengHei UI", 12, "bold"), tags="overlay")
         if mode != "左右滑桿":
