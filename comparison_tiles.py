@@ -6,7 +6,7 @@ import threading
 from itertools import groupby
 
 from PIL import Image
-from drawing_diff import compare_visible_layers
+from drawing_diff import compare_visible_layers, policy_options
 from pdf_viewport import PdfViewportSession, MAX_VIEWPORT_EDGE, MAX_VIEWPORT_PIXELS
 
 
@@ -21,7 +21,7 @@ class ComparisonTileCache:
     are opened lazily once per cache-miss frame and always closed before return.
     Tile coordinates are anchored to the drawing, not to the current viewport.
     """
-    def __init__(self, pdfs, reference_width=4096, tile_size=256, max_bytes=96*1024*1024):
+    def __init__(self, pdfs, reference_width=4096, tile_size=256, max_bytes=96*1024*1024, *, policy='strict'):
         if len(pdfs) != 2 or tile_size < 16 or max_bytes < 0 or reference_width <= 0:
             raise ValueError("Invalid tile cache configuration.")
         self.pdfs = tuple(bytes(data) for data in pdfs)
@@ -31,6 +31,8 @@ class ComparisonTileCache:
         self.cache_bytes = 0
         self.tiles = OrderedDict()
         self._lock = threading.Lock()
+        policy_options(policy)  # Validate once; a cache belongs to one policy.
+        self.policy = policy
 
     def _batches(self, missing, quality):
         """Merge contiguous misses: one PDF traversal per strip, not per tile.
@@ -147,7 +149,7 @@ class ComparisonTileCache:
                     old = render_pdf(0, render_size, render_offset)
                     new = render_pdf(1, render_size, render_offset)
                     check_cancel()
-                    batch = compare_visible_layers(old, new, mode)
+                    batch = compare_visible_layers(old, new, mode, **policy_options(self.policy, quality))
                     classifications += (x1-x0)*(y1-y0)
                     classified_batches += 1
                     del old, new

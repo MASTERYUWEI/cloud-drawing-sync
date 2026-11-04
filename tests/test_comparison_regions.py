@@ -12,6 +12,25 @@ def mask(size=(1024, 512)):
 
 
 class ProgressiveRegionTests(unittest.TestCase):
+    def test_normal_revalidates_full_cells_but_retains_offscreen_evidence(self):
+        added,removed=mask(),mask()
+        added.putpixel((50,50),255)
+        added.putpixel((900,450),255)
+        index=ComparisonRegions.from_masks(added,removed)
+        clear=mask((400,400))
+        refined=index.refine(clear,clear,4,(0,0),revalidate=True)
+        self.assertEqual(refined.regions()[1],1)
+        self.assertGreater(refined.regions()[0][0]['bbox'][0],800)
+        self.assertEqual(index.regions()[1],2)  # Previous snapshot untouched.
+        # A lower-resolution revisit cannot reintroduce an already disproven dot.
+        noise=mask((200,200))
+        noise.putpixel((100,100),255)
+        revisited=refined.refine(noise,mask((200,200)),2,(0,0),revalidate=True)
+        self.assertEqual(revisited.regions()[1],1)
+        # Nor can a partial view erase an unvisited remainder of a cell.
+        corner=mask((3,3))
+        self.assertEqual(index.refine(corner,corner,128,(-6400,-6400),revalidate=True).regions()[1],2)
+
     def test_long_wall_and_return_are_not_limited_to_initial_corner(self):
         added, removed = mask(), mask()
         added.putpixel((100, 100), 255)

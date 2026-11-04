@@ -5,6 +5,7 @@ Snapshots are immutable to the UI: workers return a new index, accepted only
 with the matching drawing generation. Unvisited subpixel changes are unknown.
 """
 import math
+from array import array
 
 from PIL import Image, ImageChops, ImageFilter
 from drawing_diff import _regions
@@ -12,10 +13,11 @@ from change_outline import outer_envelope
 
 
 class ComparisonRegions:
-    def __init__(self, size, cell, added, removed):
+    def __init__(self, size, cell, added, removed, verified=None):
         self.size, self.cell = size, cell
         self.added, self.removed = added, removed
         self._interiors = None
+        self.verified = verified
 
     def interior_hint(self, size, scale, offset):
         """Project enclosed full-drawing voids to preserve nesting when zoomed."""
@@ -39,15 +41,17 @@ class ComparisonRegions:
         return cls(added.size, cell, *masks)
 
     def swapped(self):
-        return ComparisonRegions(self.size, self.cell, self.removed, self.added)
+        return ComparisonRegions(self.size, self.cell, self.removed, self.added, self.verified)
 
-    def refine(self, added, removed, scale, offset):
+    def refine(self, added, removed, scale, offset, *, revalidate=False):
         """Conservatively retain every visible changed pixel in reference cells.
 
         Pool at most 16x16 screen pixels using binary max, not a resampling
         filter (which could erase thin lines). Map the entire pooled block to
         drawing cells. Extra margin is bounded by one block, not an arbitrary
-        enlargement of region boxes. Zoom-out frames cannot erase discoveries.
+        enlargement of region boxes. By default discoveries only accumulate.
+        Revalidation can replace fully visible cells at an equal/finer zoom,
+        retaining offscreen/partial cells and evidence from higher zooms.
         """
         if (added.size != removed.size or not math.isfinite(scale) or scale <= 0
                 or len(offset) != 2 or not all(math.isfinite(n) for n in offset)):
@@ -56,11 +60,28 @@ class ComparisonRegions:
             return self  # Initial full-page analysis is already more detailed.
         step = min(16, max(1, math.floor(scale * self.cell)))
         width, height = self.added.size
+        previous = self.verified or array('d', [0.0]) * (width * height)
+        verified = array('d', previous) if revalidate else self.verified
+        covered = []
+        if revalidate:
+            # Clear only fully visible cells, verified at this or finer zoom.
+            # Partial/offscreen cells may still contain real unvisited changes.
+            cell_pixels = self.cell * scale
+            for gy in range(max(0, math.ceil(-offset[1]/cell_pixels)),
+                            min(height, math.floor((added.height-offset[1])/cell_pixels))):
+                for gx in range(max(0, math.ceil(-offset[0]/cell_pixels)),
+                                min(width, math.floor((added.width-offset[0])/cell_pixels))):
+                    i = gy * width + gx
+                    if scale >= previous[i]:
+                        covered.append(i)
+                        verified[i] = scale
         changed = False
         updated = []
         for source, atlas in ((added, self.added), (removed, self.removed)):
             pooled = source.reduce(step)
             data = bytearray(atlas.tobytes())
+            for i in covered:
+                data[i] = 0
             for i, value in enumerate(pooled.tobytes()):
                 if not value:
                     continue
@@ -72,11 +93,14 @@ class ComparisonRegions:
                 for gy in range(y0, y1):
                     for gx in range(x0, x1):
                         index = gy * width + gx
+                        if revalidate and scale < previous[index]:
+                            continue
                         if not data[index]:
                             data[index] = 255
-                            changed = True
+            changed |= data != atlas.tobytes()
             updated.append(Image.frombytes("L", atlas.size, bytes(data)))
-        return ComparisonRegions(self.size, self.cell, *updated) if changed else self
+        changed |= revalidate and verified != self.verified
+        return ComparisonRegions(self.size, self.cell, *updated, verified) if changed else self
 
     def regions(self):
         regions, total = _regions(self.added, self.removed, cell_size=1)

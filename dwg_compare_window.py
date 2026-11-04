@@ -23,6 +23,7 @@ from comparison_regions import ComparisonRegions
 from change_outline import change_contours, cloud_paths
 from comparison_diagnostics import ComparisonDiagnostics
 from pdf_viewport import max_view_scale
+from drawing_diff import compare_previews, policy_options
 
 
 BG = "#F7F7F8"
@@ -32,6 +33,16 @@ MUTED = "#777B86"
 APRICOT = "#FBE1D1"
 RUST = "#5D2A1A"
 ACCENT = "#3B6DB4"
+
+
+def _build_region_index(images, policy):
+    differences = compare_previews(*images, include_regions=False, **policy_options(policy))
+    try:
+        return ComparisonRegions.from_masks(differences['added_mask'], differences['removed_mask'])
+    finally:
+        for value in differences.values():
+            if isinstance(value, Image.Image):
+                value.close()
 
 
 def render_viewport(image, size, scale, offset):
@@ -115,6 +126,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._region_total = 0
         self._selected_region = None
         self._generation = 0
+        self._comparison_policy = 'normal'
+        self._analysis_pending = None
         self._display_signature = None
         self._failed_signature = None
         self._viewport_pending = None
@@ -147,6 +160,8 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._status = tk.StringVar(master=self, value="選擇舊版與新版 DWG，然後按「產生比較」。")
         self._zoom_text = tk.StringVar(master=self, value="—")
         self._mode = tk.StringVar(master=self, value="差異疊圖")
+        self._sensitivity = tk.StringVar(master=self, value='一般比對')
+        self._sensitivity_menus = []
         self._show_regions = tk.BooleanVar(master=self, value=True)
         self._make_widgets()
         self.bind("<F11>", self._toggle_fullscreen, add="+")
@@ -244,6 +259,12 @@ class DwgCompareWindow(ctk.CTkToplevel):
         ctk.CTkCheckBox(modes, text="差異雲形線", variable=self._show_regions,
                         command=self._schedule_render, width=115, checkbox_width=18,
                         checkbox_height=18, fg_color=RUST).pack(side="right", padx=6)
+        sensitivity = ctk.CTkOptionMenu(
+            modes, values=['一般比對', '嚴格比對'], variable=self._sensitivity,
+            command=self._on_sensitivity, width=118, height=28,
+            fg_color=ACCENT, button_color=ACCENT)
+        sensitivity.pack(side='right', padx=8)
+        self._sensitivity_menus.append(sensitivity)
 
         surface = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0,
                                border_width=1, border_color="#E4E1DD")
@@ -326,7 +347,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._status_label.grid(row=1, column=0, sticky="ew")
         ctk.CTkLabel(
             footer,
-            text="模型空間視覺比對，需相同座標與單位；放大／平移時補全變更框，未查看的細微差異仍須複核。XREF 使用目前可讀取版本。",
+            text="模型空間視覺比對；一般模式略過細微描邊，重要細節請放大或用嚴格模式複核。XREF 使用目前可讀取版本。",
             text_color=MUTED, anchor="w", font=("Microsoft JhengHei UI", 11),
         ).grid(row=2, column=0, sticky="ew")
         self._log = ctk.CTkTextbox(footer, height=48, fg_color="#F1EFEC",
@@ -360,6 +381,12 @@ class DwgCompareWindow(ctk.CTkToplevel):
             self._focus_navigation.append(button)
         self._focus_region_label = ctk.CTkLabel(left, text="差異 0 區", width=88, text_color=RUST)
         self._focus_region_label.pack(side="left", padx=4)
+        sensitivity = ctk.CTkOptionMenu(
+            left, values=['一般比對', '嚴格比對'], variable=self._sensitivity,
+            command=self._on_sensitivity, width=108, height=34,
+            fg_color=ACCENT, button_color=ACCENT)
+        sensitivity.pack(side='left', padx=4)
+        self._sensitivity_menus.append(sensitivity)
         self._focus_cancel = ctk.CTkButton(left, text="取消轉換", width=80, height=34,
                                            fg_color=RUST, command=self._cancel_render)
         right = ctk.CTkFrame(self._focus_bar, fg_color="transparent")
@@ -459,6 +486,20 @@ class DwgCompareWindow(ctk.CTkToplevel):
             self.lift()
             self.focus_set()
 
+    def set_pair_paths(self, old_path, new_path, *, auto_start=False):
+        """Load a saved predecessor on the left and current local file on right."""
+        if self._closed:
+            return False
+        if self._busy:
+            messagebox.showinfo('比較進行中', '請等待本次比較完成或先取消，再開啟其他版本。', parent=self)
+            return False
+        self._old_path.set(os.path.normpath(os.fspath(old_path)))
+        self._new_path.set(os.path.normpath(os.fspath(new_path)))
+        self._invalidate_preview()
+        if auto_start:
+            self._start_render()
+        return True
+
     def set_new_path(self, path):
         """Reuse this window for another DWG selected in the synchronizer."""
         if self._closed:
@@ -490,7 +531,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
             self._invalidate_preview()
 
     def _swap_files(self):
-        if self._busy:
+        if self._busy or self._analysis_pending is not None:
             return
         old, new = self._old_path.get(), self._new_path.get()
         self._old_path.set(new)
@@ -520,6 +561,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._tile_cache = None
         self._drag = None
         self._generation += 1
+        self._analysis_pending = None
         self._originals = None
         self._pdfs = None
         self._views = None
@@ -542,12 +584,15 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._schedule_render()
 
     def _set_controls(self):
-        select_state = "disabled" if self._busy else "normal"
+        blocked = self._busy or self._analysis_pending is not None
+        select_state = "disabled" if blocked else "normal"
         for button in self._choose_buttons:
             button.configure(state=select_state)
         ready = bool(self._old_path.get() and self._new_path.get())
-        self._compare_button.configure(state="normal" if ready and not self._busy else "disabled")
-        self._swap_button.configure(state="normal" if ready and not self._busy else "disabled")
+        self._compare_button.configure(state="normal" if ready and not blocked else "disabled")
+        self._swap_button.configure(state="normal" if ready and not blocked else "disabled")
+        for menu in self._sensitivity_menus:
+            menu.configure(state='disabled' if self._busy else 'normal')
         self._cancel_button.configure(state="normal" if self._busy else "disabled")
         view_state = "normal" if self._originals else "disabled"
         for widget in (self._zoom_in, self._zoom_out, self._fit_button, self._slider, self._zoom_entry):
@@ -571,7 +616,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
             self._region_tree.insert("", "end", iid=str(index), text=f"{index + 1:02d}",
                                       values=(kinds[region["kind"]],), tags=(region["kind"],))
         limited = f"（共 {self._region_total} 區，清單上限 200）" if self._region_total > len(self._regions) else ""
-        self._region_summary.configure(text=f"已偵測：{len(self._regions)} 區{limited}\n放大／平移時補全範圍" if self._originals else "視覺差異區域")
+        self._region_summary.configure(text=f"已偵測：{len(self._regions)} 區{limited}\n{self._sensitivity.get()} · 放大核對" if self._originals else "視覺差異區域")
         if self._selected_region is not None and self._selected_region < len(self._regions):
             self._region_tree.selection_set(str(self._selected_region))
         self._update_focus_region()
@@ -591,7 +636,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         self._region_index, self._regions, self._region_total = index, regions, total
         self._populate_regions()
         self._set_controls()
-        self._status.set(f"已補全差異範圍：{total} 個視覺區域；相連變更會合併。尚未查看的細微差異仍須放大複核；轉換提醒請查看紀錄。")
+        self._status.set(f"已更新差異範圍：{total} 個視覺區域；{self._sensitivity.get()}。尚未查看的細微差異仍須放大複核；轉換提醒請查看紀錄。")
 
     def _update_focus_region(self):
         index = self._selected_region
@@ -636,6 +681,51 @@ class DwgCompareWindow(ctk.CTkToplevel):
         else:
             self._swipe_bar.grid_remove()
         self._schedule_render()
+
+    def _on_sensitivity(self, value):
+        if self._closed:
+            return
+        if self._busy:
+            self._sensitivity.set('一般比對' if self._comparison_policy == 'normal' else '嚴格比對')
+            return
+        policy = {'一般比對': 'normal', '嚴格比對': 'strict'}.get(value)
+        if policy is None or policy == self._comparison_policy:
+            return
+        self._sensitivity.set(value)
+        self._comparison_policy = policy
+        self._stop_zoom_animation()
+        self._viewport_cancel.set()
+        self._generation += 1
+        generation = self._generation
+        self._tile_cache = None
+        self._region_index = None
+        self._regions = []
+        self._region_total = 0
+        self._selected_region = None
+        self._display_signature = self._failed_signature = None
+        self._views = self._viewport_diff = None
+        self._populate_regions()
+        if not self._originals:
+            return
+        images = self._originals
+        self._analysis_pending = generation
+        self._status.set(f'正在切換{value}，重新判定差異；不需重新轉換 DWG…')
+        self._set_controls()
+        def analyze():
+            try:
+                return generation, _build_region_index(images, policy), None
+            except Exception as exc:
+                return generation, None, str(exc)
+        def completed(future):
+            if not self._closed and not future.cancelled():
+                self._events.put((self._job_id, 'analysis', future.result()))
+        self._view_executor.submit(analyze).add_done_callback(completed)
+        self._schedule_render()
+
+    def _policy_note(self):
+        return ('一般比對：忽略約 1 個畫面像素的描邊誤差及孤立雜點；微小修改請放大或切換嚴格比對複核。'
+                if self._comparison_policy == 'normal' else
+                '嚴格比對：顯示所有像素位置差異，可能包含重疊線或抗鋸齒雜訊。')
 
     def _append_log(self, text):
         self._log.configure(state="normal")
@@ -709,6 +799,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
         job_id = self._job_id
         self._cancel_event = threading.Event()
         cancel_event = self._cancel_event
+        policy = self._comparison_policy
         self._status.set("正在準備 DWG 預覽；轉換較大的圖面可能需要一些時間…")
         self._log.configure(state="normal")
         self._log.delete("1.0", "end")
@@ -735,14 +826,12 @@ class DwgCompareWindow(ctk.CTkToplevel):
                     new_image = _read_preview(rendered["new_png"])
                     if old_image.size != new_image.size:
                         raise ValueError("兩份預覽的尺寸不一致，無法確保圖面座標對齊。請重新產生比較。")
-                    from drawing_diff import compare_previews
                     report("正在偵測線條新增與刪除，建立可定位的差異清單…")
-                    differences = compare_previews(old_image, new_image, tolerance=0)
-                    region_index = ComparisonRegions.from_masks(differences["added_mask"], differences["removed_mask"])
+                    region_index = _build_region_index((old_image, new_image), policy)
                     pdfs = (Path(rendered["old_pdf"]).read_bytes(),
                             Path(rendered["new_pdf"]).read_bytes())
                     warnings = list(rendered.get("warnings") or [])
-                    if differences.get("regions_truncated"):
+                    if region_index.regions()[1] > 200:
                         warnings.append("差異區域較多，清單僅列出前 200 區；圖面仍顯示所有差異。")
                     result = (old_image, new_image, warnings, pdfs, region_index)
             except Exception as exc:
@@ -779,6 +868,23 @@ class DwgCompareWindow(ctk.CTkToplevel):
         try:
             while True:
                 job_id, kind, value = self._events.get_nowait()
+                if kind == 'analysis':
+                    generation, index, error = value
+                    if generation != self._generation or self._analysis_pending != generation:
+                        continue
+                    self._analysis_pending = None
+                    if error:
+                        self._status.set('重新判定失敗，請切換模式重試。')
+                        self._append_log(error)
+                    else:
+                        self._region_index = index
+                        self._regions, self._region_total = index.regions()
+                        self._populate_regions()
+                        self._status.set(f'{self._sensitivity.get()}：{self._region_total} 個視覺差異區域。' + self._policy_note())
+                        self._append_log(self._policy_note())
+                    self._set_controls()
+                    self._schedule_render()
+                    continue
                 if kind == "viewport":
                     self._viewport_pending = None
                     signature, views, differences, error = value
@@ -827,6 +933,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
                                       if regions else "全圖預覽未偵測到線條位置差異；仍可放大檢查細節。")
                                      + (" 另有轉換提醒，請查看紀錄。" if warnings else ""))
                     self._append_log("比對完成：紅色＝舊版才有（刪除）；綠色＝新版才有（新增）；灰色＝相同。")
+                    self._append_log(self._policy_note())
                     self._append_log("差異框先依全圖預覽建立，放大／平移時依可見紅綠差異補全並合併相連區域；尚未查看的極細微變更可能未列出。清單不是 CAD 圖元清單。")
                     for warning in warnings:
                         self._append_log("提醒：" + str(warning))
@@ -1041,7 +1148,7 @@ class DwgCompareWindow(ctk.CTkToplevel):
 
     def _request_viewport(self, signature):
         """Keep vector rendering off Tk; coalesce drag events to the newest view."""
-        if self._viewport_pending is not None or self._closed:
+        if self._viewport_pending is not None or self._closed or self._analysis_pending is not None:
             return
         self._viewport_pending = signature
         self._viewport_cancel = threading.Event()
@@ -1050,8 +1157,10 @@ class DwgCompareWindow(ctk.CTkToplevel):
         pdfs, originals = self._pdfs, self._originals
         _, size, scale, offset, mode, quality = signature
         if pdfs and self._tile_cache is None:
-            self._tile_cache = ComparisonTileCache(pdfs, reference_width=originals[0].width)
+            self._tile_cache = ComparisonTileCache(pdfs, reference_width=originals[0].width,
+                                                 policy=self._comparison_policy)
         cache = self._tile_cache
+        policy = self._comparison_policy
         region_index = self._region_index
         existing_regions = tuple(dict(region) for region in self._regions)
         job_id = self._job_id
@@ -1065,14 +1174,15 @@ class DwgCompareWindow(ctk.CTkToplevel):
                     views = tuple(render_viewport(im, size, scale, offset)
                                   if mode not in ("old", "new") or index == (mode == "new") else None
                                   for index, im in enumerate(originals))
-                    differences = (compare_visible_layers(*views, mode) if mode in ("overlay", "swipe")
+                    differences = (compare_visible_layers(*views, mode, **policy_options(policy)) if mode in ("overlay", "swipe")
                                    else {})
                 if cancel_event.is_set():
                     raise TileRenderCancelled()
                 regions = existing_regions
                 outline_index = region_index
                 if region_index is not None and "added_mask" in differences:
-                    refined = region_index.refine(differences["added_mask"], differences["removed_mask"], scale, offset)
+                    refined = region_index.refine(differences["added_mask"], differences["removed_mask"], scale, offset,
+                                                  revalidate=policy == 'normal')
                     outline_index = refined
                     if refined is not region_index:
                         regions, total = refined.regions()

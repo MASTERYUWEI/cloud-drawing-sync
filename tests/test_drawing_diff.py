@@ -1,11 +1,12 @@
 """Visual change classification: these are raster regions, not CAD entities."""
 from pathlib import Path
 import re
+import random
 import unittest
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageChops
 
-from drawing_diff import ADDED_COLOUR, REMOVED_COLOUR, compare_previews
+from drawing_diff import ADDED_COLOUR, REMOVED_COLOUR, compare_previews, compare_visible_layers, policy_options, _nearby
 
 
 def blank(size=(128, 96)):
@@ -13,6 +14,39 @@ def blank(size=(128, 96)):
 
 
 class DrawingDiffChecks(unittest.TestCase):
+    def test_fast_neighbourhood_matches_square_filter_including_edges(self):
+        rng=random.Random(42)
+        mask=Image.frombytes('L',(100,97),bytes(255 if rng.random()<.08 else 0 for _ in range(9700)))
+        for radius in range(1,9):
+            reference=mask.filter(ImageFilter.MaxFilter(radius*2+1))
+            self.assertIsNone(ImageChops.difference(_nearby(mask,radius),reference).getbbox())
+
+    def test_normal_filters_fringe_but_keeps_independent_thin_strokes(self):
+        old, new = blank(), blank()
+        ImageDraw.Draw(old).line((10,40,90,40), fill='black')
+        draw = ImageDraw.Draw(new)
+        draw.line((10,41,90,41), fill='black')
+        draw.line((25,60,55,60), fill='black')
+        new.putpixel((100,80),(0,0,0))
+        normal = compare_previews(old,new,**policy_options('normal'))
+        strict = compare_previews(old,new,**policy_options('strict'))
+        self.assertEqual(normal['removed_pixels'],0)
+        self.assertEqual(normal['added_pixels'],31)
+        self.assertGreater(strict['added_pixels'],normal['added_pixels'])
+        self.assertEqual(strict['removed_pixels'],81)
+        for mode in ('overlay','swipe'):
+            frame = compare_visible_layers(old,new,mode,**policy_options('normal'))
+            self.assertEqual(frame['added_mask'].tobytes(),normal['added_mask'].tobytes())
+            self.assertEqual(frame['removed_mask'].tobytes(),normal['removed_mask'].tobytes())
+
+    def test_normal_policy_sampling_and_diagonal_not_eroded(self):
+        self.assertEqual(policy_options('normal',2)['tolerance'],2)
+        self.assertEqual(policy_options('strict',2)['tolerance'],0)
+        old,new=blank(),blank()
+        ImageDraw.Draw(new).line((20,20,23,23), fill='black')
+        self.assertEqual(compare_previews(old,new,**policy_options('normal'))['added_pixels'],4)
+        with self.assertRaises(ValueError): policy_options('unknown')
+
     def test_identical_has_no_changes(self):
         old = blank()
         ImageDraw.Draw(old).rectangle((10, 10, 80, 65), outline='black')

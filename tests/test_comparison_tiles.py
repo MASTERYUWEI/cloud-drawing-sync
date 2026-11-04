@@ -12,6 +12,26 @@ from test_pdf_viewport import make_pdf
 
 
 class TileCacheTests(unittest.TestCase):
+    def test_normal_filter_has_no_tile_seams_at_both_sampling_qualities(self):
+        for quality in (1,2):
+            cache=ComparisonTileCache(self.pdfs,reference_width=1000,tile_size=128,policy='normal')
+            _,tiled=cache.render((500,350),.8,(-137,19),quality=quality)
+            _,full=render_comparison_frame(self.pdfs,(500,350),.8,(-137,19),reference_width=1000,quality=quality,policy='normal')
+            for key in ('added_mask','removed_mask'):
+                self.assertIsNone(ImageChops.difference(tiled[key],full[key]).getbbox())
+
+    def test_normal_mode_preserves_text_revision_across_tiles_and_reuses_cache(self):
+        common='0 0 0 RG 0.1 w 100 399.8 m 180 399.8 l S '
+        old=make_pdf(common+'BT /F1 18 Tf 100 380 Td (111) Tj ET')
+        new=make_pdf(common+'BT /F1 18 Tf 100 380 Td (112) Tj ET')
+        cache=ComparisonTileCache((old,new),reference_width=1000,tile_size=128,policy='normal')
+        for quality in (1,2):
+            _,frame=cache.render((500,220),4,(-300,-1120),quality=quality)
+            self.assertGreater(frame['added_pixels'],0)
+            self.assertGreater(frame['removed_pixels'],0)
+        _,again=cache.render((500,220),4,(-300,-1120))
+        self.assertEqual(again['cache_stats']['misses'],0)
+
     def setUp(self):
         common = "0 0 0 RG 0.6 w 0 40 m 700 600 l S 200 100 350 280 re S BT /F1 16 Tf 100 430 Td (TILE BOUNDARY DETAIL) Tj ET "
         self.pdfs = (make_pdf(common+"110 330 m 380 330 l S"),

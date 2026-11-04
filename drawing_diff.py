@@ -17,6 +17,45 @@ INK_THRESHOLD = 40
 MAX_REGIONS = 200
 
 
+def policy_options(policy, quality=1):
+    """Normal mode allows one display pixel, independent of 1x/2x sampling."""
+    if policy not in ('normal', 'strict') or quality not in (1, 2):
+        raise ValueError('Invalid comparison sensitivity.')
+    return dict(tolerance=quality if policy == 'normal' else 0,
+                remove_speckles=policy == 'normal')
+
+
+def _nearby(mask, radius):
+    """Separable binary dilation; identical to square MaxFilter, without sorting."""
+    result = mask
+    for axis in (0, 1):
+        source = result
+        for step in range(1, radius + 1):
+            for sign in (-1, 1):
+                shifted = Image.new('L', mask.size, 0)
+                shifted.paste(source, (sign * step, 0) if axis == 0 else (0, sign * step))
+                result = ImageChops.lighter(result, shifted)
+    return result
+
+
+def _change_masks(old_ink, new_ink, tolerance, remove_speckles):
+    if isinstance(tolerance, bool) or not isinstance(tolerance, int) or not 0 <= tolerance <= 8:
+        raise ValueError('像素容差必須是 0 到 8 的整數。')
+    old_binary, new_binary = _foreground(old_ink), _foreground(new_ink)
+    if tolerance:
+        old_near, new_near = _nearby(old_binary, tolerance), _nearby(new_binary, tolerance)
+    else:
+        old_near, new_near = old_binary, new_binary
+    masks = [ImageChops.subtract(new_binary, old_near),
+             ImageChops.subtract(old_binary, new_near)]
+    if remove_speckles:
+        # Require another changed sample in the 3x3 neighbourhood. Unlike
+        # erosion, this preserves one-pixel-wide lines and diagonal strokes.
+        masks = [ImageChops.multiply(mask, mask.filter(ImageFilter.BoxBlur(1)).point(
+            [0 if value < 50 else 255 for value in range(256)])) for mask in masks]
+    return masks
+
+
 def _ink(image):
     """Use darkest RGB channel so yellow/cyan drawing lines are not discarded."""
     if image.mode != 'RGB':
@@ -116,7 +155,7 @@ def _regions(added, removed, *, cell_size=None):
     return regions, total_regions
 
 
-def compare_previews(old_image, new_image, tolerance=1, *, include_regions=True):
+def compare_previews(old_image, new_image, tolerance=1, *, include_regions=True, remove_speckles=False):
     """Return red removals, green additions, neutral common linework.
 
     ``tolerance`` is the permitted pixel-neighbourhood mismatch (default 1).
@@ -135,15 +174,7 @@ def compare_previews(old_image, new_image, tolerance=1, *, include_regions=True)
         raise ValueError('像素容差必須是 0 到 8 的整數。')
 
     old_ink, new_ink = _ink(old_image), _ink(new_image)
-    old_binary, new_binary = _foreground(old_ink), _foreground(new_ink)
-    if tolerance:
-        kernel = ImageFilter.MaxFilter(2 * tolerance + 1)
-        old_near = old_binary.filter(kernel)
-        new_near = new_binary.filter(kernel)
-    else:
-        old_near, new_near = old_binary, new_binary
-    added = ImageChops.subtract(new_binary, old_near)
-    removed = ImageChops.subtract(old_binary, new_near)
+    added, removed = _change_masks(old_ink, new_ink, tolerance, remove_speckles)
 
     old_overlay, new_overlay = _neutral(old_ink), _neutral(new_ink)
     overlay = _neutral(ImageChops.lighter(old_ink, new_ink))
@@ -166,13 +197,14 @@ def compare_previews(old_image, new_image, tolerance=1, *, include_regions=True)
         'regions_truncated': total_regions > len(regions),
         'region_limit': MAX_REGIONS,
         'tolerance_pixels': tolerance,
+        'remove_speckles': remove_speckles,
         'ink_threshold': INK_THRESHOLD,
         'comparison_kind': 'visual_ink_regions',
     }
 
 
-def compare_visible_layers(old_image, new_image, mode="overlay"):
-    """Only colour the currently visible mode, with exact ink classification.
+def compare_visible_layers(old_image, new_image, mode="overlay", *, tolerance=0, remove_speckles=False):
+    """Only colour the visible mode, with the requested ink tolerance.
 
     No region clustering, hidden original views, or unused mode images are made.
     Full-drawing analysis still uses compare_previews independently.
@@ -180,9 +212,7 @@ def compare_visible_layers(old_image, new_image, mode="overlay"):
     if mode not in ("overlay", "swipe") or old_image.size != new_image.size:
         raise ValueError("Invalid comparison mode or mismatched image sizes.")
     old_ink, new_ink = _ink(old_image), _ink(new_image)
-    old_binary, new_binary = _foreground(old_ink), _foreground(new_ink)
-    added = ImageChops.subtract(new_binary, old_binary)
-    removed = ImageChops.subtract(old_binary, new_binary)
+    added, removed = _change_masks(old_ink, new_ink, tolerance, remove_speckles)
     result = {"added_mask": added, "removed_mask": removed}
     if mode == "overlay":
         overlay = _neutral(ImageChops.lighter(old_ink, new_ink))

@@ -21,11 +21,22 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# 通知點擊（clouddrawingsync: 連結）要秒開：在載入介面與 Google 套件之前處理。
+# 路徑規則須與 get_data_dir()/MIRROR_LOG_DIR 一致。
+if __name__ == '__main__' and sys.argv[1:2] == ['--open-updates']:
+    import local_mirror as _lm
+    _lm.open_updates(sys.argv[2] if len(sys.argv) > 2 else '',
+                     os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'),
+                                  '雲端圖資同步工具', 'mirror_logs'))
+    raise SystemExit(0)
+
 import customtkinter as ctk
+import revision_archive
+import local_mirror
 
 # ==================== 版本 / 自動更新來源 ====================
 
-APP_VERSION = '1.2.11'
+APP_VERSION = '1.3.0'
 GITHUB_OWNER = 'MASTERYUWEI'
 GITHUB_REPO = 'cloud-drawing-sync'
 UPDATE_API_URL = f'https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest'
@@ -153,7 +164,52 @@ DEFAULT_CONFIG = {
     'auto_recycle_orphans': True,
     # 啟動時自動到 GitHub Releases 檢查新版本
     'auto_update_check': True,
+    # 程式開著時每隔幾分鐘自動同步（0＝關閉）
+    'auto_sync_minutes': 0,
 }
+
+# 本機鏡像的紀錄一律放使用者資料夾：寫進目標(NAS)會被下一次 /MIR 刪掉
+MIRROR_LOG_DIR = os.path.join(DATA_DIR, 'mirror_logs')
+# 「關閉程式也同步」用的 Windows 工作排程名稱（每小時跑一次 --mirror-sync）
+MIRROR_TASK_NAME = '雲端圖資同步工具-本機鏡像'
+
+
+def is_local_pair(p):
+    return p.get('type') == 'local'
+
+
+# 通知點擊用的自訂協定。Windows 不允許從通知開 file:/// 連結（點了沒反應），
+# 所以註冊 clouddrawingsync: 給目前使用者（HKCU，免系統管理員），點擊時交給本程式開更新清單。
+OPEN_PROTOCOL = 'clouddrawingsync'
+
+
+def _launcher_command():
+    """啟動本程式的指令列（打包版用 exe；開發模式用 pythonw + 本檔）。"""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    exe = pyw if os.path.exists(pyw) else sys.executable
+    return f'"{exe}" "{os.path.abspath(__file__)}"'
+
+
+def register_open_protocol():
+    """每次跳通知前（重新）註冊，確保指向目前這份程式（升級/換位置後也正確）。"""
+    if os.name != 'nt':
+        return
+    import winreg
+    base = rf'Software\Classes\{OPEN_PROTOCOL}'
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, 'URL:雲端圖資同步工具')
+        winreg.SetValueEx(k, 'URL Protocol', 0, winreg.REG_SZ, '')
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r'\shell\open\command') as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, f'{_launcher_command()} --open-updates "%1"')
+
+
+def updates_uri(pair_name):
+    from urllib.parse import quote
+    return f'{OPEN_PROTOCOL}:mirror-updates?name={quote(pair_name, safe="")}'
+
+
 
 
 def _normalize_pairs(cfg):
@@ -171,20 +227,89 @@ def _normalize_pairs(cfg):
     for p in pairs:
         if not isinstance(p, dict):
             continue
-        clean.append({
+        local = p.get('type') == 'local'
+        item = {
+            'type': 'local' if local else 'drive',
             'name': str(p.get('name') or '未命名').strip() or '未命名',
-            'folder_id': str(p.get('folder_id') or '').strip(),
+            'folder_id': '' if local else str(p.get('folder_id') or '').strip(),
             'download_path': str(p.get('download_path') or '').strip(),
             'enabled': bool(p.get('enabled', True)),
-        })
+            'archive_updates': False if local else revision_archive.enabled(p),
+        }
+        if local:
+            # 本機資料夾鏡像：source_path → download_path（目標，通常是 NAS）
+            item['source_path'] = str(p.get('source_path') or '').strip()
+            item['exclude_dirs'] = [str(x).strip() for x in (p.get('exclude_dirs') or []) if str(x).strip()]
+            item['notify'] = bool(p.get('notify', False))
+        clean.append(item)
     cfg['sync_pairs'] = clean
     return cfg
 
 
 def enabled_pairs(cfg):
-    """回傳啟用且欄位齊全的同步資料夾清單。"""
-    return [p for p in cfg.get('sync_pairs', [])
-            if p.get('enabled') and p.get('folder_id') and p.get('download_path')]
+    """回傳啟用且欄位齊全的同步資料夾清單（Google 雲端與本機鏡像兩種）。"""
+    out = []
+    for p in cfg.get('sync_pairs', []):
+        if not p.get('enabled') or not p.get('download_path'):
+            continue
+        if is_local_pair(p):
+            if p.get('source_path'):
+                out.append(p)
+        elif p.get('folder_id'):
+            out.append(p)
+    return out
+
+
+def _display_rel(prefix, rel):
+    """與雲端同步一致的顯示路徑：根層檔案把前綴當資料夾段，今日更新才能正確分組。"""
+    if not prefix:
+        return rel
+    if os.path.dirname(rel):
+        return prefix + rel
+    return os.path.join(prefix.strip(), rel)
+
+
+def run_local_pair(pair, all_pairs, log=print, prefix=''):
+    """執行一組本機鏡像（視窗與背景排程共用）。
+
+    回傳 local_mirror.mirror 的結果，另加 new/updated/deleted（今日更新用的顯示路徑）。
+    安全檢查未過或另一個同步正在跑時丟 local_mirror.MirrorError。"""
+    others = []
+    for p in all_pairs:
+        if p is pair:
+            continue
+        others += [p.get('download_path'), p.get('source_path')]
+    lock = local_mirror.SyncLock()
+    if not lock.acquire():
+        raise local_mirror.MirrorError('另一個本機鏡像（PowerShell 版或背景排程）正在執行，這次跳過')
+    try:
+        r = local_mirror.mirror(pair, MIRROR_LOG_DIR, log=log,
+                                other_roots=[o for o in others if o])
+    finally:
+        lock.release()
+
+    name = pair.get('name') or '本機鏡像'
+    diff = r['diff']
+    if diff and r['code'] < 8:
+        local_mirror.append_csv(MIRROR_LOG_DIR, name, diff)
+    changed = [d['rel'] for d in diff if d['action'] != '刪除']
+    if pair.get('notify') and changed and r['code'] < 8:
+        try:
+            local_mirror.write_notify_record(MIRROR_LOG_DIR, name, changed)
+            register_open_protocol()
+            names = [os.path.basename(c) for c in changed]
+            line2 = names[1] if len(names) == 2 else (
+                f'{names[1]}  …等共 {len(names)} 個檔' if len(names) > 2 else '')
+            local_mirror.show_toast(f'{name} 有更新（{len(changed)} 個檔）', [names[0], line2],
+                                    updates_uri(name))
+        except OSError as e:
+            log(f'  通知未送出：{e}')
+    local_mirror.cleanup_old_logs(MIRROR_LOG_DIR)
+
+    r['new'] = [_display_rel(prefix, d['rel']) for d in diff if d['action'] == '新增']
+    r['updated'] = [_display_rel(prefix, d['rel']) for d in diff if d['action'] == '更新']
+    r['deleted'] = [_display_rel(prefix, d['rel']) for d in diff if d['action'] == '刪除']
+    return r
 
 XREF_FLAT_FILE = os.path.join(DATA_DIR, 'xref_flat_manifest.json')
 # 主圖(整合圖)判斷：檔名以 ☆ 開頭且含「整合圖」
@@ -454,10 +579,12 @@ def list_files_recursive(service, folder_id, folder_path="", log=print):
             break
     return all_files
 
-def download_file(service, file_id, file_name, mime_type, folder_path, download_path, log=print):
+def download_file(service, file_id, file_name, mime_type, folder_path, download_path, log=print, *, archive_updates=False):
     local_folder = os.path.join(download_path, folder_path)
-    os.makedirs(local_folder, exist_ok=True)
     local_path = os.path.join(local_folder, file_name)
+    if archive_updates:
+        revision_archive._relative(download_path, local_path)
+    os.makedirs(local_folder, exist_ok=True)
 
     if mime_type in GOOGLE_EXPORT_TYPES:
         export_mime, ext = GOOGLE_EXPORT_TYPES[mime_type]
@@ -482,7 +609,10 @@ def download_file(service, file_id, file_name, mime_type, folder_path, download_
             temp_path = f.name
             fh.seek(0)
             f.write(fh.read())
-        os.replace(temp_path, local_path)
+        if archive_updates:
+            revision_archive.install_revision(temp_path, local_path, download_path, log)
+        else:
+            os.replace(temp_path, local_path)
     except Exception:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -568,7 +698,7 @@ def _find_master_folders(dl_path):
     return tops
 
 
-def flatten_xrefs(dl_path, log=print, enabled=True):
+def flatten_xrefs(dl_path, log=print, enabled=True, *, archive_updates=False):
     """把各整合圖資料夾底下子圖複製一份到整合圖那層，讓 '.\\檔名.dwg' 解析得到。
 
     - 只複製、不修改任何原始 DWG；☆ 開頭的整合圖本身永不被複製。
@@ -618,11 +748,24 @@ def flatten_xrefs(dl_path, log=print, enabled=True):
                     continue
                 try:
                     if _needs_copy(src, dest):
-                        shutil.copy2(src, dest)
+                        if archive_updates:
+                            temp_copy = None
+                            try:
+                                with tempfile.NamedTemporaryFile(delete=False, dir=tf, prefix='.xref-', suffix='.tmp') as stream:
+                                    temp_copy = stream.name
+                                shutil.copy2(src, temp_copy)
+                                revision_archive.install_revision(temp_copy, dest, dl_path, log)
+                            finally:
+                                if temp_copy and os.path.exists(temp_copy):
+                                    os.remove(temp_copy)
+                        else:
+                            shutil.copy2(src, dest)
                         copied += 1
                         log(f'  套圖連結: 複製 {rel}')
                     managed.add(rel)
-                except OSError as e:
+                except (OSError, ValueError) as e:
+                    if rel in old:
+                        managed.add(rel)  # 更新失敗不是失效副本，不可由後續清理刪除。
                     log(f'  套圖連結複製失敗: {rel} | {e}')
 
     # 清理：先前建立、但這次不再需要的複製檔（來源被刪/改名，或功能關閉）
@@ -735,6 +878,8 @@ class DriveSyncApp(ctk.CTk):
     FONT_FAMILY = "Microsoft JhengHei UI"
     MONO_FONT   = "Consolas"
     TAB_NAMES   = ["同步日誌", "檔案清單", "今日更新", "未同步檔案", "更新紀錄"]
+    AUTO_SYNC_CHOICES = {'自動同步：關閉': 0, '每 30 分鐘同步': 30, '每 1 小時同步': 60,
+                         '每 2 小時同步': 120, '每 4 小時同步': 240}
 
     def __init__(self):
         super().__init__()
@@ -790,6 +935,9 @@ class DriveSyncApp(ctk.CTk):
         self.after(1000, self._auto_connect)
         if self.config.get('auto_update_check', True):
             self.after(4000, self._auto_check_update)
+        self._auto_job = None
+        self._schedule_auto_sync()
+        threading.Thread(target=self._probe_bgtask, daemon=True).start()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ══════════════════════════════════════════════
@@ -878,7 +1026,7 @@ class DriveSyncApp(ctk.CTk):
         ctk.CTkLabel(head, text="同步資料夾",
                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=15, weight="bold"),
                      text_color=Colors.TEXT).pack(side="left")
-        ctk.CTkLabel(head, text="　可新增多個「雲端 → 本機」資料夾，同步時依序處理",
+        ctk.CTkLabel(head, text="　Google 雲端或本機資料夾（如 MEGA → NAS 鏡像），同步時依序處理",
                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
                      text_color=Colors.TEXT_MUTED).pack(side="left")
         ctk.CTkFrame(card, height=1, fg_color=Colors.SURFACE_ALT).grid(
@@ -889,14 +1037,16 @@ class DriveSyncApp(ctk.CTk):
         wrap.grid(row=2, column=0, sticky="nsew", padx=25, pady=(0, 4))
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
-        self.pairs_tree = ttk.Treeview(wrap, columns=('name', 'path', 'state'),
+        self.pairs_tree = ttk.Treeview(wrap, columns=('name', 'kind', 'path', 'state'),
                                        show='headings', height=4)
         self.pairs_tree.heading('name', text='名稱')
-        self.pairs_tree.heading('path', text='本機資料夾')
+        self.pairs_tree.heading('kind', text='來源')
+        self.pairs_tree.heading('path', text='同步到')
         self.pairs_tree.heading('state', text='狀態')
         self.pairs_tree.column('name', width=110, anchor='w')
-        self.pairs_tree.column('path', width=330, anchor='w')
-        self.pairs_tree.column('state', width=56, anchor='center')
+        self.pairs_tree.column('kind', width=64, anchor='center')
+        self.pairs_tree.column('path', width=270, anchor='w')
+        self.pairs_tree.column('state', width=50, anchor='center')
         self.pairs_tree.grid(row=0, column=0, sticky='nsew')
         self.pairs_tree.bind('<Double-1>', lambda e: self._edit_pair())
 
@@ -929,8 +1079,9 @@ class DriveSyncApp(ctk.CTk):
         self.pairs_tree.delete(*self.pairs_tree.get_children())
         for i, p in enumerate(self.config.get('sync_pairs', [])):
             state = '✅' if p.get('enabled') else '⏸'
+            kind = '本機鏡像' if is_local_pair(p) else '雲端'
             self.pairs_tree.insert('', 'end', iid=str(i),
-                                   values=(p.get('name', ''), p.get('download_path', ''), state))
+                                   values=(p.get('name', ''), kind, p.get('download_path', ''), state))
 
     def _selected_pair_index(self):
         sel = self.pairs_tree.selection()
@@ -954,13 +1105,39 @@ class DriveSyncApp(ctk.CTk):
     def _add_pair(self):
         if self._pairs_locked():
             return
-        self._pair_dialog(None)
+        win = ctk.CTkToplevel(self)
+        win.title('新增同步資料夾')
+        win.geometry('460x210')
+        win.configure(fg_color=Colors.BG)
+        win.transient(self)
+        ctk.CTkLabel(win, text='要新增哪一種同步？',
+                     font=ctk.CTkFont(family=self.FONT_FAMILY, size=15, weight='bold'),
+                     text_color=Colors.TEXT).pack(anchor='w', padx=24, pady=(20, 12))
+
+        def pick(fn):
+            win.destroy()
+            fn(None)
+
+        for text, sub, fn in (
+                ('☁  Google 雲端資料夾', '從業主的 Google Drive 下載到本機/NAS', self._pair_dialog),
+                ('🖴  本機資料夾鏡像', '例如 MEGA 資料夾 → 台中 NAS，NAS 完全跟著來源', self._local_pair_dialog)):
+            ctk.CTkButton(win, text=f'{text}　　{sub}', anchor='w', height=44, corner_radius=12,
+                          font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+                          fg_color=Colors.SURFACE, text_color=Colors.TEXT,
+                          hover_color=Colors.APRICOT_HOVER, border_width=1,
+                          border_color=Colors.SURFACE_ALT,
+                          command=lambda f=fn: pick(f)).pack(fill='x', padx=24, pady=5)
+        win.after(60, win.lift)
 
     def _edit_pair(self):
         if self._pairs_locked():
             return
         idx = self._selected_pair_index()
-        if idx is not None:
+        if idx is None:
+            return
+        if is_local_pair(self.config['sync_pairs'][idx]):
+            self._local_pair_dialog(idx)
+        else:
             self._pair_dialog(idx)
 
     def _toggle_pair(self):
@@ -1001,7 +1178,7 @@ class DriveSyncApp(ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title('編輯同步資料夾' if editing else '新增同步資料夾')
-        win.geometry('560x300')
+        win.geometry('650x380')
         win.configure(fg_color=Colors.BG)
         win.transient(self)
         win.grid_columnconfigure(1, weight=1)
@@ -1016,6 +1193,7 @@ class DriveSyncApp(ctk.CTk):
         v_name = ctk.StringVar(value=p.get('name', ''))
         v_fid = ctk.StringVar(value=p.get('folder_id', ''))
         v_dl = ctk.StringVar(value=p.get('download_path', ''))
+        v_archive = ctk.BooleanVar(value=revision_archive.enabled(p))
 
         def row(r, label):
             ctk.CTkLabel(win, text=label, font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
@@ -1052,6 +1230,9 @@ class DriveSyncApp(ctk.CTk):
                       text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
                       command=browse).grid(row=2, column=2, padx=(0, 24), pady=10)
 
+        ctk.CTkCheckBox(win, text='同名更新前留存舊檔到回收區（可比對上一版）',
+                       variable=v_archive).grid(row=3, column=0, columnspan=3, padx=24, pady=10, sticky='w')
+
         def ok():
             if self.is_syncing:
                 messagebox.showinfo('同步進行中', '請等同步完成後再儲存。', parent=win); return
@@ -1066,14 +1247,13 @@ class DriveSyncApp(ctk.CTk):
                 messagebox.showerror('錯誤', '雲端資料夾連結/ID 格式不正確，\n請直接複製 Google Drive 資料夾網址貼上', parent=win); return
             if not dl:
                 messagebox.showerror('錯誤', '請選擇本機下載資料夾', parent=win); return
-            dl_key = os.path.normcase(os.path.abspath(dl))
             for i, other in enumerate(self.config['sync_pairs']):
                 if editing and i == idx:
                     continue
                 if other.get('folder_id') == fid:
                     messagebox.showerror('錯誤', f'這個雲端資料夾已在清單中（{other["name"]}）', parent=win); return
-                op = os.path.normcase(os.path.abspath(other.get('download_path') or ''))
-                if op and (dl_key == op or dl_key.startswith(op + os.sep) or op.startswith(dl_key + os.sep)):
+                op = other.get('download_path') or ''
+                if op and local_mirror.paths_overlap(dl, op):
                     messagebox.showerror(
                         '錯誤',
                         f'本機資料夾與「{other["name"]}」的下載資料夾相同或互相包含，\n'
@@ -1083,8 +1263,8 @@ class DriveSyncApp(ctk.CTk):
                 os.makedirs(dl, exist_ok=True)
             except OSError as e:
                 messagebox.showerror('錯誤', f'無法建立/存取下載資料夾：\n{e}', parent=win); return
-            entry = {'name': name, 'folder_id': fid, 'download_path': dl,
-                     'enabled': p.get('enabled', True)}
+            entry = {'type': 'drive', 'name': name, 'folder_id': fid, 'download_path': dl,
+                     'enabled': p.get('enabled', True), 'archive_updates': v_archive.get()}
             if editing:
                 self.config['sync_pairs'][idx] = entry
             else:
@@ -1096,7 +1276,155 @@ class DriveSyncApp(ctk.CTk):
             win.destroy()
 
         foot = ctk.CTkFrame(win, fg_color='transparent')
-        foot.grid(row=3, column=0, columnspan=3, sticky='e', padx=24, pady=(14, 18))
+        foot.grid(row=4, column=0, columnspan=3, sticky='e', padx=24, pady=(14, 18))
+        ctk.CTkButton(foot, text='取消', width=88, height=36, corner_radius=17,
+                      fg_color='transparent', border_width=1, border_color=Colors.SURFACE_ALT,
+                      text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
+                      command=win.destroy).pack(side='right', padx=(8, 0))
+        ctk.CTkButton(foot, text='確定', width=88, height=36, corner_radius=17,
+                      font=ctk.CTkFont(family=self.FONT_FAMILY, size=13, weight='bold'),
+                      fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER,
+                      command=ok).pack(side='right')
+        win.after(60, win.lift)
+
+    def _local_pair_dialog(self, idx):
+        """新增(idx=None)或編輯「本機資料夾 → 目標資料夾」鏡像。"""
+        editing = idx is not None
+        p = self.config['sync_pairs'][idx] if editing else \
+            {'type': 'local', 'name': '', 'source_path': '', 'download_path': '',
+             'exclude_dirs': [], 'notify': False, 'enabled': True}
+
+        win = ctk.CTkToplevel(self)
+        win.title('編輯本機資料夾鏡像' if editing else '新增本機資料夾鏡像')
+        win.geometry('700x470')
+        win.configure(fg_color=Colors.BG)
+        win.transient(self)
+        win.grid_columnconfigure(1, weight=1)
+
+        def _grab():
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+        win.after(150, _grab)
+
+        v_name = ctk.StringVar(value=p.get('name', ''))
+        v_src = ctk.StringVar(value=p.get('source_path', ''))
+        v_dst = ctk.StringVar(value=p.get('download_path', ''))
+        v_excl = ctk.StringVar(value='；'.join(p.get('exclude_dirs') or []))
+        v_notify = ctk.BooleanVar(value=bool(p.get('notify')))
+        font = ctk.CTkFont(family=self.FONT_FAMILY, size=12)
+
+        def label(r, text):
+            ctk.CTkLabel(win, text=text, font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+                         text_color=Colors.TEXT_SEC).grid(row=r, column=0, sticky='w',
+                                                          padx=(24, 10), pady=8)
+
+        def entry(r, var, placeholder='', span=2):
+            ctk.CTkEntry(win, textvariable=var, height=36, corner_radius=16, font=font,
+                         placeholder_text=placeholder,
+                         border_color=Colors.SURFACE_ALT, fg_color=Colors.SURFACE
+                         ).grid(row=r, column=1, columnspan=span, sticky='ew',
+                                padx=(0, 24 if span == 2 else 8), pady=8)
+
+        def browse_btn(r, var, title):
+            def go():
+                d = filedialog.askdirectory(title=title, parent=win,
+                                            initialdir=var.get() or os.path.expanduser('~'))
+                if d:
+                    var.set(os.path.normpath(d))
+            ctk.CTkButton(win, text='瀏覽', width=64, height=36, corner_radius=17, font=font,
+                          fg_color='transparent', border_width=1, border_color=Colors.SURFACE_ALT,
+                          text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
+                          command=go).grid(row=r, column=2, padx=(0, 24), pady=8)
+
+        label(0, '名稱')
+        entry(0, v_name, '例：A案場-施工圖')
+        label(1, '來源資料夾')
+        entry(1, v_src, '例：D:\\MEGA\\A案場\\施工圖', span=1)
+        browse_btn(1, v_src, '選擇來源資料夾')
+        label(2, '同步到（目標）')
+        entry(2, v_dst, '例：\\\\NAS\\共用\\A案場\\施工圖', span=1)
+        browse_btn(2, v_dst, '選擇目標資料夾')
+        label(3, '排除子資料夾')
+        entry(3, v_excl, '相對於來源，多個用「；」分隔，例：雲端')
+        ctk.CTkCheckBox(win, text='有新增/更新時跳 Windows 通知（點通知可看清單）',
+                        variable=v_notify, font=font).grid(row=4, column=0, columnspan=3,
+                                                           padx=24, pady=(8, 2), sticky='w')
+        ctk.CTkLabel(win, justify='left', wraplength=640, font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+                     text_color=Colors.TEXT_MUTED,
+                     text='鏡像＝目標完全跟著來源：來源刪掉的檔案，目標也會刪除。\n'
+                          'CAD 備份/鎖定檔（.bak .dwl .sv$ …）、Revit 自動備份、系統暫存與 MEGA 的 .debris 不會同步，'
+                          '目標上已有的這類檔也會清掉。'
+                     ).grid(row=5, column=0, columnspan=3, padx=24, pady=(4, 0), sticky='w')
+
+        def ok():
+            if self.is_syncing:
+                messagebox.showinfo('同步進行中', '請等同步完成後再儲存。', parent=win); return
+            if editing and not (0 <= idx < len(self.config['sync_pairs'])):
+                messagebox.showerror('錯誤', '清單已變動，請關閉視窗後重新選取。', parent=win); return
+            name = v_name.get().strip() or '未命名'
+            src = os.path.normpath(v_src.get().strip()) if v_src.get().strip() else ''
+            dst = os.path.normpath(v_dst.get().strip()) if v_dst.get().strip() else ''
+            if not src or not os.path.isdir(src):
+                messagebox.showerror('錯誤', '找不到來源資料夾，請重新選擇', parent=win); return
+            if not dst:
+                messagebox.showerror('錯誤', '請選擇目標資料夾', parent=win); return
+            d_abs = os.path.abspath(dst)
+            if os.path.splitdrive(d_abs)[1].strip('\\/') == '' or d_abs.rstrip('\\/').count(os.sep) < 1:
+                messagebox.showerror('錯誤', '目標不可以是磁碟或分享的根目錄', parent=win); return
+            if local_mirror.paths_overlap(src, dst):
+                messagebox.showerror('錯誤', '來源與目標相同或互相包含', parent=win); return
+            for i, other in enumerate(self.config['sync_pairs']):
+                if editing and i == idx:
+                    continue
+                for key in ('download_path', 'source_path'):
+                    op = other.get(key) or ''
+                    if op and local_mirror.paths_overlap(dst, op):
+                        messagebox.showerror(
+                            '錯誤',
+                            f'目標資料夾與「{other["name"]}」的資料夾相同或互相包含。\n'
+                            '鏡像會刪除目標內來源沒有的檔案，會刪到它的檔案，請改選其他資料夾。',
+                            parent=win); return
+            hit = local_mirror.find_protected_inside(dst)
+            if hit:
+                messagebox.showerror('錯誤', f'目標資料夾內含業主雲端資料夾，鏡像會把它刪掉：\n{hit}\n\n'
+                                           '請改選更下層、專用的資料夾。', parent=win); return
+            parent_dir = os.path.dirname(d_abs.rstrip('\\/'))
+            if not os.path.isdir(parent_dir):
+                if not messagebox.askyesno('連不到目標', f'目前連不到：\n{parent_dir}\n\n'
+                                                     '（NAS 沒開或沒登入？）仍要儲存設定嗎？', parent=win):
+                    return
+            changed_dst = not editing or os.path.normcase(dst) != os.path.normcase(p.get('download_path') or '')
+            if changed_dst and os.path.isdir(dst):
+                try:
+                    has_files = any(True for _ in os.scandir(dst))
+                except OSError:
+                    has_files = False
+                if has_files and not messagebox.askyesno(
+                        '目標資料夾已有檔案',
+                        f'目標資料夾已經有檔案：\n{dst}\n\n'
+                        '鏡像後目標會和來源完全一致，來源沒有的檔案會被刪除。\n'
+                        '（若這裡本來就是這組來源的鏡像，請按「是」。）確定使用這個資料夾？',
+                        parent=win):
+                    return
+            excl_raw = re.split(r'[;；\n]', v_excl.get())
+            entry_ = {'type': 'local', 'name': name, 'folder_id': '',
+                      'source_path': src, 'download_path': dst,
+                      'exclude_dirs': local_mirror.normalize_exclude_dirs(src, excl_raw),
+                      'notify': bool(v_notify.get()),
+                      'enabled': p.get('enabled', True), 'archive_updates': False}
+            if editing:
+                self.config['sync_pairs'][idx] = entry_
+            else:
+                self.config['sync_pairs'].append(entry_)
+            save_config(self.config)
+            self._reload_pairs_view()
+            self._log(f"已{'更新' if editing else '新增'}本機鏡像「{name}」：{src} → {dst}", 'success')
+            win.destroy()
+
+        foot = ctk.CTkFrame(win, fg_color='transparent')
+        foot.grid(row=6, column=0, columnspan=3, sticky='e', padx=24, pady=(14, 18))
         ctk.CTkButton(foot, text='取消', width=88, height=36, corner_radius=17,
                       fg_color='transparent', border_width=1, border_color=Colors.SURFACE_ALT,
                       text_color=Colors.TEXT_SEC, hover_color=Colors.SURFACE,
@@ -1148,6 +1476,28 @@ class DriveSyncApp(ctk.CTk):
             hover_color=Colors.APRICOT_HOVER,
             command=self._open_dwg_compare,
         ).pack(side="left", padx=(12, 0))
+
+        # 定時同步（程式開著時）
+        minutes = int(self.config.get('auto_sync_minutes', 0) or 0)
+        cur = next((k for k, v in self.AUTO_SYNC_CHOICES.items() if v == minutes), '自動同步：關閉')
+        self.v_auto = ctk.StringVar(value=cur)
+        ctk.CTkOptionMenu(
+            bar, variable=self.v_auto, values=list(self.AUTO_SYNC_CHOICES.keys()),
+            width=150, height=36, corner_radius=18,
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+            dropdown_font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+            fg_color=Colors.SURFACE_ALT, button_color=Colors.SURFACE_ALT,
+            button_hover_color=Colors.APRICOT_HOVER, text_color=Colors.TEXT,
+            command=self._on_auto_sync_change,
+        ).pack(side="left", padx=(12, 0))
+
+        # 關閉程式後仍定時鏡像本機資料夾（Windows 工作排程）
+        self.v_bgtask = ctk.BooleanVar(value=False)
+        self.chk_bgtask = ctk.CTkCheckBox(
+            bar, text="關閉程式也每小時鏡像本機資料夾", variable=self.v_bgtask,
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=12), text_color=Colors.TEXT_SEC,
+            command=self._on_bgtask_toggle)
+        self.chk_bgtask.pack(side="left", padx=(12, 0))
 
         ctk.CTkButton(
             bar, text="重新載入", width=120, height=38, corner_radius=19,
@@ -1303,7 +1653,7 @@ class DriveSyncApp(ctk.CTk):
         self.lbl_today_title.pack(side="left", padx=(8, 0))
 
         ctk.CTkLabel(
-            toolbar, text="　左鍵開啟檔案｜右鍵顯示操作選單",
+            toolbar, text="　檔名：開啟檔案｜按鈕：比對上一版",
             font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
             text_color=Colors.TEXT_MUTED,
         ).pack(side="left")
@@ -1391,6 +1741,8 @@ class DriveSyncApp(ctk.CTk):
             font=ctk.CTkFont(family=self.FONT_FAMILY, size=14, weight="bold"),
             text_color=Colors.TEXT)
         self.lbl_hist_title.pack(side="left", padx=(8, 0))
+        ctk.CTkButton(toolbar, text='比對選取檔案的最近留存版', width=200,
+                      command=self._compare_history_revision).pack(side='right', padx=8)
 
         ctk.CTkButton(
             toolbar, text="重新整理", height=34, width=120, corner_radius=17,
@@ -1606,17 +1958,107 @@ class DriveSyncApp(ctk.CTk):
 
     # ── Sync ──
 
-    def _do_sync(self):
+    def _do_sync(self, auto=False):
         if self.is_syncing:
-            self._log('同步進行中，請稍候', 'warning'); return
-        if not self.service:
-            self._log('尚未連線', 'error'); return
-        if not enabled_pairs(self.config):
-            messagebox.showerror('錯誤', '請先在「同步資料夾」清單按「➕ 新增」\n加入至少一個要同步的資料夾。')
+            if not auto:
+                self._log('同步進行中，請稍候', 'warning')
             return
+        try:
+            if str(self.btn_sync.cget('state')) == 'disabled':
+                return   # 自動更新安裝中
+        except Exception:
+            pass
+        pairs = enabled_pairs(self.config)
+        if not pairs:
+            if not auto:
+                messagebox.showerror('錯誤', '請先在「同步資料夾」清單按「➕ 新增」\n加入至少一個要同步的資料夾。')
+            return
+        # 本機鏡像不需要 Google 登入；只有雲端資料夾時才要求連線
+        if not self.service and not any(is_local_pair(p) for p in pairs):
+            self._log('尚未連線 Google，這次略過同步' if auto else '尚未連線', 'warning' if auto else 'error')
+            return
+        if auto:
+            self._log('定時同步開始', 'info')
+        self._sync_auto = auto
         self.is_syncing = True
         self.btn_sync.configure(state='disabled', text="同步中...")
         threading.Thread(target=self._sync_worker, daemon=True).start()
+
+    # ── 定時同步（程式開著時） ──
+
+    def _schedule_auto_sync(self):
+        if getattr(self, '_auto_job', None):
+            try:
+                self.after_cancel(self._auto_job)
+            except Exception:
+                pass
+            self._auto_job = None
+        minutes = int(self.config.get('auto_sync_minutes', 0) or 0)
+        if minutes > 0:
+            self._auto_job = self.after(minutes * 60 * 1000, self._auto_sync_tick)
+
+    def _auto_sync_tick(self):
+        self._auto_job = None
+        try:
+            self._do_sync(auto=True)
+        finally:
+            self._schedule_auto_sync()
+
+    def _on_auto_sync_change(self, choice):
+        minutes = self.AUTO_SYNC_CHOICES.get(choice, 0)
+        self.config['auto_sync_minutes'] = minutes
+        save_config(self.config)
+        self._schedule_auto_sync()
+        self._log(f'定時同步：{"關閉" if not minutes else f"每 {minutes} 分鐘"}（程式開著時）', 'info')
+
+    # ── 背景排程（關閉程式也同步本機鏡像） ──
+
+    @staticmethod
+    def _bgtask_command():
+        if getattr(sys, 'frozen', False):
+            return f'"{sys.executable}" --mirror-sync'
+        pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        exe = pyw if os.path.exists(pyw) else sys.executable
+        return f'"{exe}" "{os.path.abspath(__file__)}" --mirror-sync'
+
+    @staticmethod
+    def _schtasks(*args):
+        return subprocess.run(['schtasks', *args], capture_output=True,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+
+    def _probe_bgtask(self):
+        try:
+            exists = self._schtasks('/query', '/tn', MIRROR_TASK_NAME).returncode == 0
+        except OSError:
+            exists = False
+        try:
+            self.after(0, lambda: self.v_bgtask.set(exists))
+        except Exception:
+            pass
+
+    def _on_bgtask_toggle(self):
+        want = bool(self.v_bgtask.get())
+        try:
+            if want:
+                if not any(is_local_pair(p) for p in self.config.get('sync_pairs', [])):
+                    messagebox.showinfo('沒有本機鏡像', '清單裡還沒有「本機資料夾鏡像」，\n新增後再開啟這個選項。')
+                    self.v_bgtask.set(False)
+                    return
+                r = self._schtasks('/create', '/f', '/tn', MIRROR_TASK_NAME,
+                                   '/sc', 'hourly', '/tr', self._bgtask_command())
+            else:
+                r = self._schtasks('/delete', '/f', '/tn', MIRROR_TASK_NAME)
+        except OSError as e:
+            r = None
+            err = str(e)
+        else:
+            err = (r.stderr or r.stdout or b'').decode('mbcs', errors='replace').strip()
+        if r is not None and r.returncode == 0:
+            self._log(('已建立' if want else '已移除') + f'背景排程「{MIRROR_TASK_NAME}」'
+                      + ('：每小時鏡像本機資料夾，關閉程式也會跑' if want else ''), 'success')
+        else:
+            self.v_bgtask.set(not want)
+            messagebox.showerror('背景排程設定失敗', err or '未知錯誤')
 
     @staticmethod
     def _sync_error_info(exc):
@@ -1803,18 +2245,33 @@ class DriveSyncApp(ctk.CTk):
 
             new_c = upd_c = unch_c = err_c = 0
             session_new, session_upd, session_err = [], [], []
+            session_del = []                # 本機鏡像刪除的檔（只進歷史，不進今日更新）
             session_ok_keys = set()         # {(folder_id, fileId)}：pending 過濾需分資料夾
             all_conflict_rows = []          # 攤平同名衝突（跨資料夾彙整）
             orphan_rows_recycled = []       # 已回收孤兒（跨資料夾彙整）
             orphan_rows_report = []         # 僅回報孤兒
             failed_pairs = []
+            mirror_skips = []               # 本機鏡像安全檢查未過（NAS 連不到等）
             any_listed = False
+            auto = getattr(self, '_sync_auto', False)
 
             for pair in pairs:
                 pname = pair.get('name') or pair['folder_id'][:8]
                 prefix = self._pair_prefix(pair, multi)
                 try:
-                    r = self._sync_one_pair(pair, state, prefix)
+                    if is_local_pair(pair):
+                        r = self._sync_local_pair(pair, prefix)
+                        if not r.pop('ok_run', True):
+                            failed_pairs.append(r.pop('fail_info'))
+                    elif not self.service:
+                        self._log(f'{prefix}尚未連線 Google，略過此雲端資料夾', 'warning')
+                        continue
+                    else:
+                        r = self._sync_one_pair(pair, state, prefix)
+                except local_mirror.MirrorError as e:
+                    self._log(f'{prefix}本機鏡像略過：{e}', 'warning')
+                    mirror_skips.append(f'「{pname}」{e}')
+                    continue
                 except Exception as e:
                     reason, hint = self._sync_error_info(e)
                     self._log(f'{prefix}同步流程中止: {reason}', 'error')
@@ -1827,17 +2284,22 @@ class DriveSyncApp(ctk.CTk):
                 session_new.extend(r['session_new'])
                 session_upd.extend(r['session_upd'])
                 session_err.extend(r['session_err'])
+                session_del.extend(r.get('session_del', []))
                 session_ok_keys |= r['ok_keys']
                 all_conflict_rows.extend(r['conflicts'])
                 orphan_rows_recycled.extend(r['orphans_recycled'])
                 orphan_rows_report.extend(r['orphans_report'])
 
-            if failed_pairs:
+            # 定時同步不跳對話框（NAS 暫時連不到時每小時跳一次會很煩），只記在日誌
+            if failed_pairs and not auto:
                 pn, reason, hint, detail = failed_pairs[0]
                 head = f'資料夾「{pn}」{reason}' if multi else reason
                 if len(failed_pairs) > 1:
                     head += f'（另有 {len(failed_pairs) - 1} 個資料夾失敗）'
                 self.after(0, lambda h=head, hi=hint, d=detail: self._show_sync_fatal_error(h, hi, d))
+            if mirror_skips and not auto:
+                self.after(0, lambda m='\n'.join(mirror_skips): messagebox.showwarning(
+                    '本機鏡像未執行', f'{m}\n\n目標資料夾沒有被動到。排除原因後再同步即可。'))
 
             if not any_listed and not session_err:
                 # 所有資料夾都空清單或失敗：不寫歷史、不更新上次同步時間（與舊版一致）
@@ -1855,11 +2317,14 @@ class DriveSyncApp(ctk.CTk):
                 if pkey(p) not in session_ok_keys and pkey(p) not in err_keys
             ]
             history['pending'].extend(session_err)
-            history['sessions'].append({
+            session = {
                 'timestamp': datetime.now().isoformat(timespec='seconds'),
                 'type': 'sync',
                 'new': session_new, 'updated': session_upd, 'errors': session_err,
-            })
+            }
+            if session_del:
+                session['deleted'] = session_del
+            history['sessions'].append(session)
             save_history(history)
 
             if all_conflict_rows:
@@ -1900,7 +2365,44 @@ class DriveSyncApp(ctk.CTk):
             self.after(0, lambda reason=reason, hint=hint, detail=detail: self._show_sync_fatal_error(reason, hint, detail))
         finally:
             self.is_syncing = False
+            self._sync_auto = False
             self.after(0, lambda: self.btn_sync.configure(state='normal', text="立即同步"))
+
+    def _sync_local_pair(self, pair, prefix):
+        """本機資料夾鏡像一組，回傳與 _sync_one_pair 相同形狀的結果。"""
+        if prefix:
+            self._log('─' * 40, 'info')
+        self._log(f"{prefix}本機鏡像：{pair['source_path']}  →  {pair['download_path']}", 'info')
+        r = run_local_pair(pair, self.config.get('sync_pairs', []),
+                           log=lambda s: self._log(f'{prefix}{s.strip()}', 'info'), prefix=prefix)
+        diff = r['diff']
+        tags = {'新增': 'new', '更新': 'update', '刪除': 'warning'}
+        for d in diff[:40]:
+            self._log(f"{d['action']}: {_display_rel(prefix, d['rel'])}", tags[d['action']])
+        if len(diff) > 40:
+            self._log(f'  …另有 {len(diff) - 40} 筆，完整清單見同步紀錄.csv', 'info')
+        if r['junk_removed']:
+            self._log(f"{prefix}清掉目標上 {r['junk_removed']} 個 CAD 備份/暫存檔", 'info')
+        if r['stuck']:
+            self._log(f"{prefix}目標上有 {r['stuck']} 個舊檔刪不掉（可能有人開著），下次同步會再試", 'warning')
+        n_new = len(r['new']); n_upd = len(r['updated'])
+        out = {'new': n_new, 'upd': n_upd, 'unch': max(0, r.get('src_count', 0) - n_new - n_upd),
+               'err': 0 if r['ok'] else max(1, r['failed']), 'listed': True,
+               'session_new': r['new'], 'session_upd': r['updated'], 'session_del': r['deleted'],
+               'session_err': [], 'ok_keys': set(), 'conflicts': [],
+               'orphans_recycled': [], 'orphans_report': [], 'ok_run': r['ok']}
+        if r['ok']:
+            if not diff:
+                self._log(f'{prefix}沒有變動，目標已是最新', 'success')
+            else:
+                self._log(f"{prefix}鏡像完成  新增 {n_new}、更新 {n_upd}、刪除 {len(r['deleted'])}", 'success')
+        else:
+            msg = f"有 {r['failed']} 個檔案沒複製成功（robocopy 代碼 {r['code']}）"
+            self._log(f'{prefix}{msg}，明細：{r["detail_log"]}', 'error')
+            out['fail_info'] = (pair.get('name') or '本機鏡像', msg,
+                                '檔案可能被佔用，或目標空間/權限不足；下次同步會再試。',
+                                r['detail_log'])
+        return out
 
     def _sync_one_pair(self, pair, state, prefix):
         """同步單一「雲端資料夾 → 本機資料夾」，回傳統計與待彙整資訊。"""
@@ -1957,7 +2459,8 @@ class DriveSyncApp(ctk.CTk):
                 result['unch'] += 1; continue
 
             try:
-                dl_result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log)
+                dl_result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log,
+                                          archive_updates=revision_archive.enabled(pair))
             except Exception as e:
                 result['err'] += 1
                 reason, hint = self._sync_error_info(e)
@@ -1975,6 +2478,7 @@ class DriveSyncApp(ctk.CTk):
                     'pairName': pname,
                     'folderId': folder_id,
                     'downloadPath': dl_path,
+                    'archiveUpdates': revision_archive.enabled(pair),
                     'time': datetime.now().isoformat(timespec='seconds'),
                 })
                 self._log(f'  未同步: {display}', 'error')
@@ -2000,7 +2504,8 @@ class DriveSyncApp(ctk.CTk):
         # 整合圖 XREF 攤平：複製子圖到整合圖那層，讓外部參考解析得到
         try:
             fx = flatten_xrefs(dl_path, self._log,
-                               enabled=self.config.get('flatten_xrefs', True))
+                               enabled=self.config.get('flatten_xrefs', True),
+                               archive_updates=revision_archive.enabled(pair))
             conflicts = fx['conflicts']
             if fx['copied'] or fx['removed'] or conflicts:
                 self._log(
@@ -2170,18 +2675,23 @@ class DriveSyncApp(ctk.CTk):
         self._open_in_explorer(path)
         return 'break'
 
-    def _open_dwg_compare(self, initial_new_path=None):
+    def _open_dwg_compare(self, initial_new_path=None, initial_old_path=None, auto_start=False):
         """開啟獨立的 DWG 版次比較視窗，不需先執行同步。"""
         current = getattr(self, '_dwg_compare_window', None)
         if current is not None and current.winfo_exists():
             current.deiconify()
             current.lift()
+            if initial_old_path:
+                current.set_pair_paths(initial_old_path, initial_new_path, auto_start=auto_start)
+                return
             if initial_new_path:
                 current.set_new_path(initial_new_path)
             return
         try:
             from dwg_compare_window import DwgCompareWindow
             self._dwg_compare_window = DwgCompareWindow(self, initial_new_path)
+            if initial_old_path:
+                self._dwg_compare_window.set_pair_paths(initial_old_path, initial_new_path, auto_start=auto_start)
         except ImportError:
             messagebox.showerror(
                 '缺少比較元件',
@@ -2194,6 +2704,31 @@ class DriveSyncApp(ctk.CTk):
             return
         self._open_dwg_compare(initial_new_path=path)
 
+    def _compare_previous_version(self, folder, name, open_folder=False):
+        path = self._resolve_today_file(folder, name)
+        if not path or not path.lower().endswith('.dwg'):
+            messagebox.showinfo('無法比對', '請選擇仍存在的 DWG 檔案。', parent=self)
+            return 'break'
+        if self.is_syncing:
+            messagebox.showinfo('同步進行中', '請等同步與套圖連結整理完成後再比對。', parent=self)
+            return 'break'
+        for pair in self.config.get('sync_pairs', []):
+            root = pair.get('download_path')
+            if not root:
+                continue
+            try:
+                record = revision_archive.latest_revision(root, path)
+            except (OSError, ValueError):
+                continue
+            if record:
+                if open_folder:
+                    self._open_in_explorer(record['old_path'])
+                    return 'break'
+                self._open_dwg_compare(initial_new_path=path, initial_old_path=record['old_path'], auto_start=True)
+                return 'break'
+        messagebox.showinfo('尚無留存版本', '找不到此檔案的舊版留存。\n此功能只能保留啟用後的更新，無法補回先前已覆蓋的檔案。', parent=self)
+        return 'break'
+
     def _show_today_file_menu(self, event, folder, name):
         """在檔名旁顯示右鍵操作選單，不直接執行動作。"""
         menu = tk.Menu(self, tearoff=False)
@@ -2202,6 +2737,10 @@ class DriveSyncApp(ctk.CTk):
             command=lambda f=folder, n=name: self._open_today_folder(f, n))
         if name.lower().endswith('.dwg'):
             menu.add_separator()
+            menu.add_command(label='比對上一版（左：留存／右：目前）',
+                             command=lambda f=folder, n=name: self._compare_previous_version(f, n))
+            menu.add_command(label='開啟上一版留存位置',
+                             command=lambda f=folder, n=name: self._compare_previous_version(f, n, open_folder=True))
             menu.add_command(
                 label='DWG 版次比較…',
                 command=lambda f=folder, n=name: self._compare_today_file(f, n))
@@ -2236,6 +2775,9 @@ class DriveSyncApp(ctk.CTk):
         except Exception:
             yv = 0.0
         txt.configure(state="normal")
+        for button in getattr(self, '_today_compare_buttons', []):
+            button.destroy()
+        self._today_compare_buttons = []
         for t in txt.tag_names():
             if t.startswith(("todayhdr_", "todayfile_")):
                 txt.tag_delete(t)
@@ -2267,6 +2809,16 @@ class DriveSyncApp(ctk.CTk):
                         fid += 1
                         txt.insert("end", f'      {idx:02d}. ')
                         txt.insert("end", name, ("today_file", ftag))
+                        if title == '更新' and name.lower().endswith('.dwg'):
+                            txt.insert('end', ' ', ())
+                            button = tk.Button(
+                                txt, text='比對上一版', font=(self.FONT_FAMILY, 10, 'bold'),
+                                bg=Colors.ACCENT, fg='white', activebackground=Colors.RUST,
+                                activeforeground='white', relief='flat', cursor='hand2',
+                                padx=10, pady=3, takefocus=True,
+                                command=lambda f=folder, n=name: self._compare_previous_version(f, n))
+                            txt.window_create('end', window=button, padx=8, pady=3)
+                            self._today_compare_buttons.append(button)
                         txt.insert("end", "\n")
                         txt.tag_bind(
                             ftag, "<Button-1>",
@@ -2381,6 +2933,7 @@ class DriveSyncApp(ctk.CTk):
 
     def _render_history(self):
         sessions = load_history().get('sessions', [])
+        self._history_compare_files = {}
         self.hist_tree.delete(*self.hist_tree.get_children())
         if not sessions:
             self.hist_tree.insert('', 'end', text='尚無同步紀錄，執行「立即同步」後會自動記錄。')
@@ -2407,15 +2960,19 @@ class DriveSyncApp(ctk.CTk):
             for s in reversed(day_sessions):
                 ts = str(s.get('timestamp', ''))
                 t_disp = ts[11:16] if len(ts) >= 16 else ts
-                kind = '重試' if s.get('type') == 'retry' else '同步'
+                kind = {'retry': '重試', 'mirror': '背景鏡像'}.get(s.get('type'), '同步')
                 sn, su, se = s.get('new', []), s.get('updated', []), s.get('errors', [])
-                if sn or su or se:
+                sd = s.get('deleted', [])
+                if sn or su or se or sd:
                     txt = f"{t_disp} {kind} — 新增 {len(sn)}、更新 {len(su)}、失敗 {len(se)}"
+                    if sd:
+                        txt += f"、刪除 {len(sd)}"
                 else:
                     txt = f"{t_disp} {kind} — 無變更"
                 sid = self.hist_tree.insert(date_id, 'end', text=txt, tags=('session',))
                 self._insert_history_files(sid, '新增', sn, 'newf')
                 self._insert_history_files(sid, '更新', su, 'updf')
+                self._insert_history_files(sid, '刪除', sd, 'errf')
                 self._insert_history_files(
                     sid, '失敗',
                     [f"{item.get('file', '?')}｜{item.get('reason', '')}" for item in se],
@@ -2424,10 +2981,21 @@ class DriveSyncApp(ctk.CTk):
     def _insert_history_files(self, parent, label, items, tag):
         LIMIT = 200
         for it in items[:LIMIT]:
-            self.hist_tree.insert(parent, 'end', text=f"{label}　{it}", tags=(tag,))
+            iid = self.hist_tree.insert(parent, 'end', text=f"{label}　{it}", tags=(tag,))
+            if tag == 'updf' and str(it).lower().endswith('.dwg'):
+                self._history_compare_files[iid] = str(it)
         if len(items) > LIMIT:
             self.hist_tree.insert(parent, 'end', tags=(tag,),
                                   text=f"…另有 {len(items) - LIMIT} 個")
+
+    def _compare_history_revision(self):
+        selected = self.hist_tree.selection()
+        display = self._history_compare_files.get(selected[0]) if selected else None
+        if not display:
+            messagebox.showinfo('選擇更新檔案', '請展開紀錄並選取一個更新的 DWG。此按鈕比對最近留存版與目前檔案，不是該筆歷史日期的完整快照。', parent=self)
+            return
+        folder, name = os.path.split(display)
+        self._compare_previous_version(folder, name)
 
     def _do_retry(self):
         if self.is_syncing:
@@ -2475,7 +3043,10 @@ class DriveSyncApp(ctk.CTk):
                     continue
                 self._log(f'重試: {display}', 'update')
                 try:
-                    result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log)
+                    retry_pair = next((pair for pair in self.config.get('sync_pairs', []) if pair.get('folder_id') == folder_id),
+                                      {'name': p.get('pairName'), 'archive_updates': p.get('archiveUpdates', p.get('pairName') == '主要圖資')})
+                    result = download_file(self.service, fid, fname, mime, fpath, dl_path, self._log,
+                                           archive_updates=revision_archive.enabled(retry_pair))
                 except Exception as e:
                     reason, hint = self._sync_error_info(e)
                     p2 = dict(p)
@@ -2607,9 +3178,67 @@ class DriveSyncApp(ctk.CTk):
     # ── Close ──
 
     def _on_close(self):
+        if getattr(self, '_auto_job', None):
+            try:
+                self.after_cancel(self._auto_job)
+            except Exception:
+                pass
         self.destroy()
 
 
+def run_mirror_cli():
+    """背景排程進入點（--mirror-sync）：只跑啟用中的本機鏡像，不開視窗、不需 Google 登入。"""
+    os.makedirs(MIRROR_LOG_DIR, exist_ok=True)
+    status_file = os.path.join(MIRROR_LOG_DIR, '最後一次結果.txt')
+    lines = []
+
+    def log(s):
+        lines.append(f"[{datetime.now().strftime('%H:%M:%S')}] {s}")
+
+    cfg = load_config()
+    all_enabled = enabled_pairs(cfg)
+    multi = len(all_enabled) > 1
+    new, upd, dele, failed = [], [], [], []
+    for pair in [p for p in all_enabled if is_local_pair(p)]:
+        name = pair.get('name') or '本機鏡像'
+        prefix = DriveSyncApp._pair_prefix(pair, multi)
+        try:
+            r = run_local_pair(pair, cfg.get('sync_pairs', []), log=log, prefix=prefix)
+        except local_mirror.MirrorError as e:
+            log(f'【{name}】略過：{e}')
+            failed.append(name)
+            continue
+        except Exception as e:
+            log(f'【{name}】錯誤：{type(e).__name__}: {e}')
+            failed.append(name)
+            continue
+        new += r['new']; upd += r['updated']; dele += r['deleted']
+        state = '成功' if r['ok'] else f"有 {r['failed']} 個檔沒複製成功（代碼 {r['code']}）"
+        if r['stuck']:
+            state += f"，{r['stuck']} 個舊檔刪不掉（有人開著），下次再試"
+        log(f"【{name}】{state}：新增 {len(r['new'])}、更新 {len(r['updated'])}、刪除 {len(r['deleted'])}")
+        if not r['ok']:
+            failed.append(name)
+
+    if new or upd or dele:
+        history = load_history()
+        session = {'timestamp': datetime.now().isoformat(timespec='seconds'), 'type': 'mirror',
+                   'new': new, 'updated': upd, 'errors': []}
+        if dele:
+            session['deleted'] = dele
+        history['sessions'].append(session)
+        save_history(history)
+    try:
+        head = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {'有失敗' if failed else '全部成功'}  背景鏡像"
+        with open(status_file, 'w', encoding='utf-8-sig') as f:
+            f.write(head + '\n' + '\n'.join(lines) + '\n')
+    except OSError:
+        pass
+    return 1 if failed else 0
+
+
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['--mirror-sync']:
+        raise SystemExit(run_mirror_cli())
     app = DriveSyncApp()
     app.mainloop()

@@ -20,13 +20,13 @@ def reproject_image(image, size, source_scale, source_offset, scale, offset):
                            resample=Image.Resampling.BILINEAR, fillcolor="white")
 
 
-def render_comparison_frame(pdfs, size, scale, offset, reference_width=4096, quality=2):
+def render_comparison_frame(pdfs, size, scale, offset, reference_width=4096, quality=2, *, policy='strict'):
     """Rasterize vectors at 2x then reduce colours with antialiasing.
 
     Detection is performed before reduction, preserving sub-screen-pixel detail.
     Bounded by visible canvas dimensions, not by the full drawing's zoom size.
     """
-    from drawing_diff import compare_previews
+    from drawing_diff import compare_previews, policy_options
     from pdf_viewport import render_pdf_viewport
 
     # Keep very large / multi-monitor windows within a predictable memory bound.
@@ -35,7 +35,7 @@ def render_comparison_frame(pdfs, size, scale, offset, reference_width=4096, qua
     render_offset = tuple(value * factor for value in offset)
     raw_views = tuple(render_pdf_viewport(data, render_size, scale * factor, render_offset,
                                           reference_width=reference_width) for data in pdfs)
-    differences = compare_previews(*raw_views, tolerance=0, include_regions=False)
+    differences = compare_previews(*raw_views, include_regions=False, **policy_options(policy, factor))
     if factor > 1:
         views = tuple(im.resize(size, Image.Resampling.LANCZOS) for im in raw_views)
         for key in ("overlay", "old_overlay", "new_overlay"):

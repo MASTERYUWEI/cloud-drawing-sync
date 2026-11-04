@@ -90,6 +90,19 @@ class CompareWindowWorkflow(unittest.TestCase):
         self.assertFalse(self.generated_directory.exists())
         self.assertTrue(all(self.window._pdfs))
 
+    def test_archived_pair_auto_start_and_busy_protection(self):
+        win = self.window
+        with patch.object(win, '_start_render') as start:
+            self.assertTrue(win.set_pair_paths('saved-old.dwg', 'current.dwg', auto_start=True))
+            self.assertEqual(win._old_path.get(), 'saved-old.dwg')
+            self.assertEqual(win._new_path.get(), 'current.dwg')
+            start.assert_called_once()
+        win._busy = True
+        with patch('dwg_compare_window.messagebox.showinfo'):
+            self.assertFalse(win.set_pair_paths('other-old.dwg', 'other-new.dwg', auto_start=True))
+        self.assertEqual(win._old_path.get(), 'saved-old.dwg')
+        win._busy = False
+
     def test_failed_conversion_report_can_be_copied_after_temp_cleanup(self):
         def fail(*args, **kwargs):
             kwargs['diagnostics'].note(stage='舊版：PDF 出圖', media='ISO 4A0', exit_code=0)
@@ -218,6 +231,32 @@ class CompareWindowWorkflow(unittest.TestCase):
         self.assertIsNone(self.window._viewport_diff)
         self.assertIsNone(self.window._tile_cache)
         self.assertFalse(self.window._regions)
+
+    def test_sensitivity_switch_reuses_pdfs_preserves_view_and_rejects_old_analysis(self):
+        self.load_fixture()
+        win=self.window
+        self.assertEqual(win._comparison_policy,'normal')
+        self.assertEqual(len(win._sensitivity_menus),2)  # Normal and fullscreen controls.
+        pdfs,images=win._pdfs,win._originals
+        position=(win._scale,win._offset)
+        old_cache=win._tile_cache
+        with patch('dwg_preview.render_dwg_pair') as converter:
+            win._on_sensitivity('嚴格比對')
+            stale_generation=win._generation
+            win._on_sensitivity('一般比對')
+            self.assertFalse(win._regions)
+            self.pump_until(lambda: win._analysis_pending is None and win._frame_matches(win._view_signature()))
+            converter.assert_not_called()
+        self.assertIs(win._pdfs,pdfs)
+        self.assertIs(win._originals,images)
+        self.assertEqual((win._scale,win._offset),position)
+        self.assertIsNot(win._tile_cache,old_cache)
+        self.assertEqual(win._tile_cache.policy,'normal')
+        index=win._region_index
+        win._events.put((win._job_id,'analysis',(stale_generation,None,'obsolete error')))
+        win._poll_worker()
+        self.assertIs(win._region_index,index)
+        self.assertNotIn('obsolete',win._status.get())
 
     def test_panning_moves_cached_photo_without_waiting_for_worker(self):
         self.load_fixture()
